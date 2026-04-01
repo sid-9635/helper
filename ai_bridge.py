@@ -2,6 +2,7 @@ import aiohttp
 import asyncio
 import json
 import os
+from collections import OrderedDict
 from pathlib import Path
 
 from config import OPENAI_API_KEY as CONFIG_OPENAI_API_KEY
@@ -36,10 +37,30 @@ def _chat_system_message() -> str:
 
 
 class AIBridge:
+    _CACHE_MAX = 20  # maximum number of cached responses
+
     def __init__(self, db):
         self.db = db
         self.session = None
         self._cached_api_key = None
+        self._response_cache: OrderedDict[str, str] = OrderedDict()
+
+    def _cache_get(self, key: str) -> str | None:
+        """Return cached response for *key*, promoting it to most-recent."""
+        normalized = key.strip().lower()
+        if normalized in self._response_cache:
+            self._response_cache.move_to_end(normalized)
+            return self._response_cache[normalized]
+        return None
+
+    def _cache_set(self, key: str, value: str) -> None:
+        """Store *value* under *key*, evicting the oldest entry if over capacity."""
+        normalized = key.strip().lower()
+        if normalized in self._response_cache:
+            self._response_cache.move_to_end(normalized)
+        self._response_cache[normalized] = value
+        if len(self._response_cache) > self._CACHE_MAX:
+            self._response_cache.popitem(last=False)  # evict oldest
 
     async def _ensure_session(self):
         if self.session is None or self.session.closed:
@@ -84,6 +105,13 @@ class AIBridge:
                 return payload.get("text")
 
     async def ask_gpt(self, text: str, mode: str = "chat", stream: bool = False, on_delta=None, fast: bool = False) -> str | None:
+        # Cache is only applied to non-streaming chat calls (not hints, not streamed)
+        use_cache = (mode == "chat" and not stream)
+        if use_cache:
+            cached = self._cache_get(text)
+            if cached is not None:
+                return cached
+
         if mode == "hint":
             prompt = _hint_prompt(text)
             system_message = "You are a concise interview coach. Return only short, bulleted hints."
@@ -95,20 +123,18 @@ class AIBridge:
         else:
             prompt = text
             if fast:
-                # minimal context for speed
                 system_message = "You are a concise coding assistant. Provide minimal, runnable Python solutions when applicable."
-                # Increase token limit for fast mode to reduce truncated responses
-                max_tokens = 1200
+                max_tokens = 500
                 messages = [
                     {"role": "system", "content": system_message},
                     {"role": "user", "content": prompt}
                 ]
             else:
                 system_message = _chat_system_message()
-                max_tokens = 800
+                max_tokens = 500
                 messages = [
                     {"role": "system", "content": system_message},
-                    *self._get_context(6),
+                    *self._get_context(3),
                     {"role": "user", "content": prompt}
                 ]
 
@@ -116,7 +142,7 @@ class AIBridge:
             "model": "gpt-4o-mini",
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0.2,
+            "temperature": 0.3,
             "stream": stream,
         }
 
@@ -144,6 +170,8 @@ class AIBridge:
             if content:
                 self.db.save_message("user", text)
                 self.db.save_message("assistant", content)
+                if use_cache:
+                    self._cache_set(text, content)
                 return content
 
             return f"API returned no message: {result}"
@@ -179,6 +207,67 @@ class AIBridge:
             self.db.save_message("assistant", content)
 
         return content
+
+    async def stream_gpt(self, text: str):
+        """Async generator that yields partial response tokens as they arrive.
+
+        Usage:
+            async for token in bridge.stream_gpt("your question"):
+                print(token, end="", flush=True)
+        """
+        system_message = _chat_system_message()
+        messages = [
+            {"role": "system", "content": system_message},
+            *self._get_context(3),
+            {"role": "user", "content": text},
+        ]
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": messages,
+            "max_tokens": 70,
+            "temperature": 0.3,
+            "stream": True,
+        }
+
+        session = await self._ensure_session()
+        async with session.post(GPT_URL, json=payload) as resp:
+            if resp.status != 200:
+                try:
+                    error_payload = await resp.json()
+                except Exception:
+                    error_payload = await resp.text()
+                yield f"API error {resp.status}: {error_payload}"
+                return
+
+            full_content = []
+            async for line_bytes in resp.content:
+                line = line_bytes.decode("utf-8").strip()
+                if not line:
+                    continue
+                if line == "data: [DONE]":
+                    break
+                if not line.startswith("data:"):
+                    continue
+
+                try:
+                    chunk = json.loads(line[len("data:"):].strip())
+                except json.JSONDecodeError:
+                    continue
+
+                if "error" in chunk:
+                    message = chunk["error"].get("message")
+                    yield f"API error: {message or chunk['error']}"
+                    return
+
+                delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+                if delta:
+                    full_content.append(delta)
+                    yield delta
+
+            assembled = "".join(full_content)
+            if assembled:
+                self.db.save_message("user", text)
+                self.db.save_message("assistant", assembled)
 
     async def process(self, wav_path: str) -> tuple[str | None, str | None]:
         transcript = await self.transcribe(wav_path)

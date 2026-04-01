@@ -135,6 +135,7 @@ class OverlayApp:
         self.log.tag_configure("user", foreground="#b8860b", background="#1b1d2a", spacing1=1, spacing3=2)
         self.log.tag_configure("assistant", foreground="#50fa7b", background="#282a36", spacing1=1, spacing3=2)
         self.log.tag_configure("system", foreground="#50fa7b", background="#111111", spacing1=1, spacing3=2)
+        self.log.tag_configure("thinking", foreground="#888888", background="#1a1a1a", spacing1=1, spacing3=2)
         self.log.pack(padx=6, fill="both", expand=True)
         self.log.bind("<Control-c>", self.copy_selection)
         self.log.bind("<Control-Insert>", self.copy_selection)
@@ -285,6 +286,14 @@ class OverlayApp:
 
     def _append_assistant_chunk(self, text: str):
         def append():
+            # Clear "Thinking..." placeholder on the very first real token
+            try:
+                pos = getattr(self, '_thinking_placeholder_start', None)
+                if pos is not None:
+                    self.log.delete(pos, tk.END)
+                    del self._thinking_placeholder_start
+            except Exception:
+                pass
             self.log.insert(tk.END, text, "assistant")
             # accumulate into current assistant buffer for possible translation
             try:
@@ -315,6 +324,9 @@ class OverlayApp:
         # reset user-scrolled flag so auto-anchoring can occur initially
         self._user_scrolled = False
         self.log.insert(tk.END, "Assistant: ", "assistant")
+        # Insert "Thinking..." placeholder; cleared on first real token
+        self._thinking_placeholder_start = self.log.index(tk.END)
+        self.log.insert(tk.END, "Thinking...", "thinking")
         # ensure anchor is visible
         try:
             self.log.see(self._assistant_stream_anchor)
@@ -351,6 +363,14 @@ class OverlayApp:
             pass
 
     def _finish_assistant_stream(self):
+        # Clear "Thinking..." placeholder if no tokens ever arrived (error / empty response)
+        try:
+            pos = getattr(self, '_thinking_placeholder_start', None)
+            if pos is not None:
+                self.log.delete(pos, tk.END)
+                del self._thinking_placeholder_start
+        except Exception:
+            pass
         self.log.insert(tk.END, "\n", "assistant")
         # commit the last assistant buffer so it can be converted later
         try:
@@ -518,17 +538,60 @@ class OverlayApp:
     # ----------------- Interview listener callbacks -----------------
     def _on_listener_transcript(self, transcript: str):
         try:
-            # show short transcript as a 'user' message
-            self.root.after(0, lambda: self.log_message('user', transcript))
+            def _show():
+                # Insert user message directly (not via log_message) so we can
+                # record the exact position right after it without a scheduling gap.
+                self.log.insert(tk.END, f"You: {transcript}\n", "user")
+                self.log.see(tk.END)
+                # Record position NOW — after the user line — so delete never touches it
+                self._listener_thinking_start = self.log.index(tk.END)
+                self.log.insert(tk.END, "Assistant: Thinking...\n", "thinking")
+                try:
+                    self.log.see(self._listener_thinking_start)
+                except Exception:
+                    pass
+            self.root.after(0, _show)
         except Exception:
             pass
 
-    def _on_listener_answer(self, answer: str):
-        try:
-            # append assistant answer into the UI
-            self.root.after(0, lambda: self.log_message('assistant', answer))
-        except Exception:
-            pass
+    def _on_listener_answer_delta(self, token: str):
+        """Called for each streamed token from the listener GPT call."""
+        def _append():
+            try:
+                self.log.insert(tk.END, token, "assistant")
+                anchor = getattr(self, '_listener_stream_anchor', None)
+                if anchor and not getattr(self, '_user_scrolled', False):
+                    self.log.see(anchor)
+            except Exception:
+                pass
+        self.root.after(0, _append)
+
+    def _on_listener_answer(self, full_reply: str):
+        """Called at end of stream with the assembled full reply (for _last_assistant)."""
+        def _finish():
+            # Always clear Thinking... first — defensive regardless of streaming state
+            try:
+                pos = getattr(self, '_listener_thinking_start', None)
+                if pos is not None:
+                    self.log.delete(pos, tk.END)
+                    del self._listener_thinking_start
+            except Exception:
+                pass
+
+            if hasattr(self, '_listener_stream_anchor'):
+                # Streaming was active — tokens already appended, just close out
+                try:
+                    self.log.insert(tk.END, "\n", "assistant")
+                    self._last_assistant = full_reply
+                    if not getattr(self, '_user_scrolled', False):
+                        self.log.see(tk.END)
+                    del self._listener_stream_anchor
+                except Exception:
+                    pass
+            else:
+                # Non-streaming fallback or streaming that never started — show full answer
+                self.log_message('assistant', full_reply)
+        self.root.after(0, _finish)
 
     def _toggle_listener(self):
         # Start or stop the interview listener in a non-disruptive way
@@ -539,7 +602,13 @@ class OverlayApp:
 
             if not self._listener or not getattr(self._listener, '_running', False):
                 try:
-                    self._listener = LiveInterviewListener(self.ai, self.loop, on_transcript=self._on_listener_transcript, on_answer=self._on_listener_answer, on_status=self._on_listener_status)
+                    self._listener = LiveInterviewListener(
+                        self.ai, self.loop,
+                        on_transcript=self._on_listener_transcript,
+                        on_answer=self._on_listener_answer,
+                        on_status=self._on_listener_status,
+                    )
+                    self._listener.on_answer_delta = self._on_listener_answer_delta
                     self._listener.start()
                     try:
                         self.listener_button.config(bg="#ff4444")
@@ -567,12 +636,44 @@ class OverlayApp:
     def _on_listener_status(self, status: str):
         # receive lifecycle and error updates from LiveInterviewListener
         # noisy operational messages update a status label only, not the log
-        _NOISY = ('rms ', 'flushing ', 'force-flush', 'filtered:', 'stream open')
+        _NOISY = ('rms ', 'flushing ', 'force-flush', 'partial-mark', 'filtered:', 'stream open')
         try:
             if status == 'started':
                 self.root.after(0, lambda: self.log_message('system', 'Interview listener thread started'))
             elif status == 'stopped':
                 self.root.after(0, lambda: self.log_message('system', 'Interview listener thread stopped'))
+            elif status == 'answer:streaming_start':
+                # First token arrived — swap Thinking... for the real stream
+                def _begin_stream():
+                    try:
+                        pos = getattr(self, '_listener_thinking_start', None)
+                        if pos is not None:
+                            self.log.delete(pos, tk.END)
+                            del self._listener_thinking_start
+                    except Exception:
+                        pass
+                    self._listener_stream_anchor = self.log.index(tk.END)
+                    self.log.insert(tk.END, "Assistant: ", "assistant")
+                    try:
+                        self.log.see(self._listener_stream_anchor)
+                    except Exception:
+                        pass
+                self.root.after(0, _begin_stream)
+            elif status == 'answer:streaming_end':
+                pass  # handled in _on_listener_answer
+            elif status == 'answer:skipped':
+                # Filter blocked the GPT call — clear any Thinking... placeholder
+                def _clear_thinking():
+                    try:
+                        pos = getattr(self, '_listener_thinking_start', None)
+                        if pos is not None:
+                            self.log.delete(pos, tk.END)
+                            del self._listener_thinking_start
+                    except Exception:
+                        pass
+                self.root.after(0, _clear_thinking)
+            elif status == 'answer:final':
+                pass  # non-streaming path — answer is delivered via on_answer
             elif status and (status.startswith('error:') or status.startswith('transcribe_error') or status.startswith('stream_open_error')):
                 self.root.after(0, lambda s=status: self.log_message('system', f'Listener error: {s}'))
             elif status and any(status.startswith(p) for p in _NOISY):
