@@ -112,7 +112,13 @@ class LiveInterviewListener:
         _JUNK = {
             "", "you", "you.", "thank you", "thank you.", "thanks", "thanks.",
             "bye", "bye.", "bye bye.", ".", "..", "...", "uh", "uh.", "um", "um.",
-            "[music]", "[applause]", "subtitles by", "thanks for watching.",
+            "[music]", "[applause]", "subtitles by", "hi", "hi.", "hey", "hey.",
+            "thanks for watching", "thanks for watching.", "thank you for watching",
+            "thank you for watching.", "thank you so much for watching",
+            "thank you so much for watching.", "thanks for watching!",
+            "thank you for watching!", "always be happy", "always be happy.",
+            "please subscribe", "don't forget to subscribe", "like and subscribe",
+            "see you next time", "see you in the next video",
         }
         wav_path = None
         try:
@@ -197,6 +203,7 @@ class LiveInterviewListener:
 
         BLOCK = int(use_sr * 0.5)          # 500 ms per callback block
         SILENCE_END = 3                    # 3 × 500 ms = 1.5 s silence → flush
+        MIN_SPEECH = 2                     # 2 × 500 ms = 1 s minimum real speech
         MAX_CHUNKS = 20                    # 20 × 500 ms = 10 s → force-flush
 
         self._emit(
@@ -237,8 +244,9 @@ class LiveInterviewListener:
                     if speech_buf:
                         silence_chunks += 1
                         if silence_chunks >= SILENCE_END:
-                            self._emit(f"flushing {len(speech_buf)} chunk(s) after queue timeout…")
-                            self._dispatch_flush(speech_buf[:], use_sr)
+                            if len(speech_buf) >= MIN_SPEECH:
+                                self._emit(f"flushing {len(speech_buf)} chunk(s) after queue timeout…")
+                                self._dispatch_flush(speech_buf[:], use_sr)
                             speech_buf = []
                             silence_chunks = 0
                     continue
@@ -267,8 +275,9 @@ class LiveInterviewListener:
                     if speech_buf:
                         silence_chunks += 1
                         if silence_chunks >= SILENCE_END:
-                            self._emit(f"flushing {len(speech_buf)} chunk(s)…")
-                            self._dispatch_flush(speech_buf[:], use_sr)
+                            if len(speech_buf) >= MIN_SPEECH:
+                                self._emit(f"flushing {len(speech_buf)} chunk(s)…")
+                                self._dispatch_flush(speech_buf[:], use_sr)
                             speech_buf = []
                             silence_chunks = 0
 
