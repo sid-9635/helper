@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+chat.db
+assistant_data.db
+models/
+tools/

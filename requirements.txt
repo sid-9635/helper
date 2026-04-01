@@ -1,0 +1,10 @@
+aiohttp
+pillow
+pytesseract
+python-dotenv
+aiohttp
+sounddevice
+numpy
+Pillow
+pytesseract
+# vosk, pocketsphinx and pyttsx3 removed — lightweight capture-only UI

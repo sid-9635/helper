@@ -1,0 +1,1772 @@
+import os
+import ctypes
+import platform
+import sys
+import threading
+import time
+import asyncio
+import tkinter as tk
+from ctypes import wintypes
+from pathlib import Path
+from typing import Callable
+from ai_bridge import AIBridge
+from database import Database
+
+WDA_MONITOR = 1
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+
+
+class OverlayApp:
+    """Tkinter overlay UI for the assistant.
+
+    This class focuses on UI concerns and delegates AI calls to `AIBridge`.
+    """
+
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Stealth ChatGPT Overlay")
+        self._capture_affinity = None
+        self._capture_error_logged = False
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-alpha", 0.7)
+        self.root.geometry("520x320+100+100")
+        self.root.configure(bg="#111111")
+
+        self.drag_offset = (0, 0)
+
+        # async loop and AI bridge for fast streaming responses
+        self.db = Database()
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self._start_async_loop, daemon=True).start()
+        self.ai = AIBridge(self.db)
+        # pre-warm the AI HTTP session to reduce first-request latency
+        try:
+            asyncio.run_coroutine_threadsafe(self.ai._ensure_session(), self.loop)
+        except Exception:
+            pass
+
+        self._build_ui()
+        # apply taskbar-hide styles shortly after UI is built (Windows only)
+        try:
+            self.root.after(50, self._apply_taskbar_hide)
+        except Exception:
+            pass
+        self.root.after(200, self._hide_from_capture)
+        self.root.protocol("WM_DELETE_WINDOW", self.stop)
+
+    def _start_async_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def _build_ui(self):
+        # small draggable header to save vertical space (title/status hidden)
+        header_frame = tk.Frame(self.root, height=16, bg="#111111", cursor="arrow")
+        header_frame.pack(fill="x")
+        header_frame.pack_propagate(False)
+        grip = tk.Label(header_frame, text=" ", bg="#111111")
+        grip.pack(side="left", padx=2, pady=1)
+        # header controls: camera (capture) and a close (X) button
+        # pack close first so camera appears to its left
+        self.header_close = tk.Button(
+            header_frame,
+            text="✕",
+            command=self.stop,
+            bg="#333333",
+            fg="white",
+            relief="flat",
+            padx=6,
+            pady=0,
+            bd=0,
+            cursor="hand2"
+        )
+        self.header_close.pack(side="right", padx=6, pady=2)
+
+        self.header_capture = tk.Button(
+            header_frame,
+            text="📸",
+            command=self.capture_screen_and_answer,
+            bg="#e69900",
+            fg="black",
+            relief="flat",
+            padx=6,
+            pady=0,
+            bd=0,
+            cursor="hand2"
+        )
+        self.header_capture.pack(side="right", padx=6, pady=2)
+
+        # status_label kept for programmatic updates but not displayed to save space
+        self.status_label = tk.Label(
+            self.root,
+            text="",
+            fg="#a6e22e",
+            bg="#111111",
+            font=("Segoe UI", 9)
+        )
+
+        self.log = tk.Text(
+            self.root,
+            bg="#111111",
+            fg="#ffffff",
+            insertbackground="#ffffff",
+            selectbackground="#44475a",
+            selectforeground="#f8f8f2",
+            exportselection=True,
+            takefocus=True,
+            cursor="xterm",
+            height=16,
+            relief="flat",
+            wrap="word"
+        )
+        # slightly smaller default font for denser display
+        try:
+            self.log.configure(font=("Segoe UI", 9))
+        except Exception:
+            pass
+        # reduce inter-line spacing to make the log denser; darken assistant yellow
+        self.log.tag_configure("user", foreground="#8be9fd", background="#1b1d2a", spacing1=1, spacing3=2)
+        self.log.tag_configure("assistant", foreground="#caa300", background="#282a36", spacing1=1, spacing3=2)
+        self.log.tag_configure("system", foreground="#50fa7b", background="#111111", spacing1=1, spacing3=2)
+        self.log.pack(padx=6, fill="both", expand=True)
+        self.log.bind("<Control-c>", self.copy_selection)
+        self.log.bind("<Control-Insert>", self.copy_selection)
+        self.log.bind("<Control-a>", self.select_all)
+        self.log.bind("<Button-3>", self._show_context_menu)
+        # detect user scroll/interaction to stop auto-anchoring
+        self.log.bind("<MouseWheel>", self._on_user_scroll)
+        self.log.bind("<Button-4>", self._on_user_scroll)
+        self.log.bind("<Button-5>", self._on_user_scroll)
+        self.log.bind("<Button-1>", self._on_user_scroll)
+
+        self.text_menu = tk.Menu(self.root, tearoff=0)
+        self.text_menu.add_command(label="Copy", command=self.copy_selection)
+        self.text_menu.add_command(label="Select All", command=self.select_all)
+
+        prompt_frame = tk.Frame(self.root, bg="#111111")
+        prompt_frame.pack(fill="x", padx=8, pady=(2, 6))
+
+        self.prompt_entry = tk.Entry(
+            prompt_frame,
+            bg="#222222",
+            fg="white",
+            insertbackground="white",
+            relief="flat",
+            font=("Segoe UI", 9)
+        )
+        self.prompt_entry.pack(side="left", fill="x", expand=True, ipady=2)
+        self.prompt_entry.bind("<Return>", self.send_prompt)
+        
+        # language selection dropdown (default: Python)
+        self.lang_var = tk.StringVar(value="Python")
+        lang_options = ["Python", "Java", "JavaScript", "C++", "C#", "Go", "Ruby"]
+        try:
+            lang_menu = tk.OptionMenu(prompt_frame, self.lang_var, *lang_options, command=self._on_lang_change)
+            lang_menu.config(bg="#222222", fg="white", relief="flat")
+            lang_menu.pack(side="left", padx=6)
+        except Exception:
+            # fallback: no dropdown on environments with issues
+            pass
+        
+
+        self.send_button = tk.Button(
+            prompt_frame,
+            text="Send",
+            command=self.send_prompt,
+            width=10,
+            bg="#44b94e",
+            fg="white",
+            relief="flat"
+        )
+        self.send_button.pack(side="left", padx=(6, 0))
+
+        button_frame = tk.Frame(self.root, bg="#111111")
+        button_frame.pack(pady=6)
+
+        # Capture button: screenshot + OCR preview
+        self.capture_button = tk.Button(
+            button_frame,
+            text="Capture",
+            command=self.capture_screen_and_answer,
+            width=12,
+            bg="#e69900",
+            fg="black",
+            relief="flat"
+        )
+        self.capture_button.pack(side="left", padx=6)
+
+        close_button = tk.Button(
+            button_frame,
+            text="Exit",
+            command=self.stop,
+            width=12,
+            bg="#666666",
+            fg="white",
+            relief="flat"
+        )
+        close_button.pack(side="left", padx=6)
+
+        # allow moving the window by dragging the small header (or the grip)
+        header_frame.bind("<ButtonPress-1>", self._start_move)
+        header_frame.bind("<B1-Motion>", self._on_move)
+        grip.bind("<ButtonPress-1>", self._start_move)
+        grip.bind("<B1-Motion>", self._on_move)
+        self.root.bind("<Escape>", lambda event: self.stop())
+        # global keyboard shortcut for quick full-screen capture
+        try:
+            self.root.bind_all('<Control-Shift-s>', lambda e: self.capture_screen_and_answer())
+        except Exception:
+            pass
+
+        # capture state
+        self._last_ocr = None
+        self._capture_cancelled = False
+
+    def _on_move(self, event):
+        x = self.root.winfo_x() + event.x - self.drag_offset[0]
+        y = self.root.winfo_y() + event.y - self.drag_offset[1]
+        self.root.geometry(f"+{x}+{y}")
+
+    def _start_move(self, event):
+        """Begin window move: record pointer offset within the widget."""
+        try:
+            # event.x/event.y are widget-local coordinates at press
+            self.drag_offset = (event.x, event.y)
+        except Exception:
+            self.drag_offset = (0, 0)
+
+    def copy_selection(self, event=None):
+        try:
+            selected = self.log.selection_get()
+            self.root.clipboard_clear()
+            self.root.clipboard_append(selected)
+        except tk.TclError:
+            pass
+        return "break"
+
+    def select_all(self, event=None):
+        self.log.focus_set()
+        self.log.tag_add(tk.SEL, "1.0", tk.END)
+        self.log.mark_set(tk.INSERT, "1.0")
+        self.log.see(tk.INSERT)
+        return "break"
+
+    def _append_assistant_chunk(self, text: str):
+        def append():
+            self.log.insert(tk.END, text, "assistant")
+            # accumulate into current assistant buffer for possible translation
+            try:
+                if not hasattr(self, '_assistant_buffer'):
+                    self._assistant_buffer = ''
+                self._assistant_buffer += text
+            except Exception:
+                pass
+            # keep view anchored at the start of the assistant stream if set
+            try:
+                anchor = getattr(self, "_assistant_stream_anchor", None)
+                user_scrolled = getattr(self, "_user_scrolled", False)
+                # Only auto-anchor while streaming if the user hasn't manually scrolled
+                if anchor and not user_scrolled:
+                    self.log.see(anchor)
+            except Exception:
+                pass
+        self.root.after(0, append)
+
+    def _begin_assistant_stream(self):
+        # record an anchor index at the start of the assistant response
+        self._assistant_stream_anchor = self.log.index(tk.END)
+        # reset buffer where streaming chunks will be collected
+        try:
+            self._assistant_buffer = ''
+        except Exception:
+            pass
+        # reset user-scrolled flag so auto-anchoring can occur initially
+        self._user_scrolled = False
+        self.log.insert(tk.END, "Assistant: ", "assistant")
+        # ensure anchor is visible
+        try:
+            self.log.see(self._assistant_stream_anchor)
+        except Exception:
+            pass
+
+    def _cancel_current_stream(self):
+        """Attempt to cancel any in-progress AI future and remove partial assistant output."""
+        try:
+            fut = getattr(self, '_current_ai_future', None)
+            if fut and not fut.done():
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # remove partial assistant text from the UI if a stream anchor exists
+        try:
+            anchor = getattr(self, '_assistant_stream_anchor', None)
+            if anchor:
+                def _del():
+                    try:
+                        self.log.delete(anchor, tk.END)
+                    except Exception:
+                        pass
+                self.root.after(0, _del)
+                try:
+                    delattr(self, '_assistant_stream_anchor')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _finish_assistant_stream(self):
+        self.log.insert(tk.END, "\n", "assistant")
+        # commit the last assistant buffer so it can be converted later
+        try:
+            self._last_assistant = getattr(self, '_assistant_buffer', '')
+            if hasattr(self, '_assistant_buffer'):
+                delattr(self, '_assistant_buffer')
+        except Exception:
+            self._last_assistant = None
+        # after finishing, run a quick completeness check and request continuation if truncated
+        try:
+            last = getattr(self, '_last_assistant', '') or ''
+            def _incomplete(s: str) -> bool:
+                try:
+                    if not s or not s.strip():
+                        return False
+                    # unbalanced code fences
+                    if s.count('```') % 2 != 0:
+                        return True
+                    # ends with alphanumeric (likely cut mid-sentence)
+                    st = s.strip()
+                    if st and st[-1].isalnum():
+                        return True
+                    return False
+                except Exception:
+                    return False
+
+            if _incomplete(last):
+                # ask for continuation non-streaming to get the remainder reliably
+                def _complete():
+                    try:
+                        lang = getattr(self, 'lang_var', None).get() if getattr(self, 'lang_var', None) else 'Python'
+                        cont_prompt = (
+                            f"Continue and finish the previous assistant response. Ensure any open code blocks are completed and provide the remaining code and any missing explanation. Respond in {lang}.\n\nPrevious assistant output:\n" + last
+                        )
+                        future = asyncio.run_coroutine_threadsafe(
+                            self.ai.ask_gpt(cont_prompt, mode='chat', stream=False, fast=True),
+                            self.loop,
+                        )
+                        try:
+                            extra = future.result(timeout=60) or ''
+                            if extra:
+                                self.root.after(0, lambda: self.log_message('assistant', extra))
+                                # append to last_assistant so conversions include full text
+                                try:
+                                    self._last_assistant = (self._last_assistant or '') + '\n' + extra
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                threading.Thread(target=_complete, daemon=True).start()
+        except Exception:
+            pass
+
+        # If the assistant did not include example usages or an interviewer-style explanation,
+        # request them once and append to the response.
+        try:
+            def _has_examples_or_expl(s: str) -> bool:
+                try:
+                    if not s or not s.strip():
+                        return False
+                    low = s.lower()
+                    if 'example' in low or 'usage' in low or 'usage:' in low:
+                        return True
+                    # look for 'Example' code block markers followed by text
+                    if 'example usage' in low or 'example usage:' in low:
+                        return True
+                    return False
+                except Exception:
+                    return False
+
+            if not getattr(self, '_examples_requested', False) and not _has_examples_or_expl(last):
+                def _request_examples():
+                    try:
+                        self._examples_requested = True
+                        lang = getattr(self, 'lang_var', None).get() if getattr(self, 'lang_var', None) else 'Python'
+                        req = (
+                            f"Please append at least two short example usages (with concrete values) showing how to run or call the code in the previous assistant response. Place these examples immediately after the code block and before the explanation. "
+                            f"Then add a brief interviewer-style explanation describing design choices, complexity, and edge-cases. Respond in {lang}.\n\nPrevious assistant output:\n" + last
+                        )
+                        future = asyncio.run_coroutine_threadsafe(
+                            self.ai.ask_gpt(req, mode='chat', stream=False, fast=True),
+                            self.loop,
+                        )
+                        try:
+                            extra = future.result(timeout=60) or ''
+                            if extra:
+                                self.root.after(0, lambda: self.log_message('assistant', extra))
+                                try:
+                                    self._last_assistant = (self._last_assistant or '') + '\n' + extra
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                threading.Thread(target=_request_examples, daemon=True).start()
+        except Exception:
+            pass
+
+        try:
+            # if the user didn't scroll, show full response at end; otherwise respect user's position
+            user_scrolled = getattr(self, "_user_scrolled", False)
+            if not user_scrolled:
+                try:
+                    self.log.see(tk.END)
+                except Exception:
+                    pass
+            # clear the anchor so future output scrolls normally
+            if hasattr(self, "_assistant_stream_anchor"):
+                delattr(self, "_assistant_stream_anchor")
+        except Exception:
+            pass
+
+    def _show_context_menu(self, event):
+        try:
+            self.text_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.text_menu.grab_release()
+
+    def _on_user_scroll(self, event=None):
+        # mark that the user interacted with the text area to stop auto-anchoring
+        try:
+            self._user_scrolled = True
+        except Exception:
+            self._user_scrolled = True
+        return None
+
+    def _on_lang_change(self, value):
+        # called when user selects a different language from the dropdown
+        try:
+            target = value
+        except Exception:
+            target = self.lang_var.get()
+        # cancel any in-progress stream and if there's a recent assistant response, auto-convert
+        try:
+            self._cancel_current_stream()
+        except Exception:
+            pass
+        # debounce rapid language changes: schedule conversion after short delay
+        try:
+            if getattr(self, '_pending_lang_job', None):
+                try:
+                    self.root.after_cancel(self._pending_lang_job)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        def _schedule():
+            last = getattr(self, '_last_assistant', None)
+            if last and last.strip():
+                self.log_message('system', f'Converting last assistant response to {target}...')
+                threading.Thread(target=self._convert_last_response_to, args=(target,), daemon=True).start()
+            else:
+                self.log_message('system', f'Language set to {target}. No previous assistant response to convert.')
+
+        try:
+            self._pending_lang_job = self.root.after(300, _schedule)
+        except Exception:
+            # fallback: run immediately
+            _schedule()
+
+    def _convert_last_response_to(self, target_lang: str):
+        try:
+            text = getattr(self, '_last_assistant', '')
+            if not text or not text.strip():
+                return
+            # build a conversion prompt that asks for language translation and preserving/adding human comments
+            conv = (
+                f"Convert the following code and explanation into {target_lang}. Preserve the behavior exactly. "
+                "If the original code contains comments, convert them to the target language's single-line comment syntax and keep them natural and human-sounding. "
+                "If the original code lacks line comments, add short human-sounding comments to every line explaining what it does. "
+                "Use the target language's idiomatic style and provide runnable code blocks where applicable.\n\n"
+                "Original assistant response:\n" + text
+            )
+            # Ask converter to include an example usage snippet when producing code
+            conv += ("\n\nAdditionally: when you output code, include at least two short example usages showing how to call or run the converted code with concrete example values. Place these examples immediately after the code block and before the explanation. "
+                     "After the examples, provide a concise explanation written for an interviewer: describe why you chose this approach, trade-offs, complexity, and any edge-cases handled.")
+            # stream the converted result into the UI
+            self.root.after(0, self._begin_assistant_stream)
+            future = asyncio.run_coroutine_threadsafe(
+                self.ai.ask_gpt(conv, mode="chat", stream=True, on_delta=self._append_assistant_chunk, fast=True),
+                self.loop,
+            )
+            self._current_ai_future = future
+            try:
+                future.result(timeout=300)
+            except Exception as exc:
+                self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Conversion error: {type(exc).__name__}: {exc}'))
+            finally:
+                self.root.after(0, self._finish_assistant_stream)
+                try:
+                    delattr(self, '_current_ai_future')
+                except Exception:
+                    pass
+        except Exception as exc:
+            try:
+                self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Conversion unexpected error: {type(exc).__name__}: {exc}'))
+            except Exception:
+                pass
+
+    def _make_window_layered(self, hwnd):
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED = 0x80000
+        exstyle = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if exstyle & WS_EX_LAYERED:
+            return
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, exstyle | WS_EX_LAYERED)
+
+    def _set_display_affinity(self, hwnd, affinity):
+        fn = ctypes.windll.user32.SetWindowDisplayAffinity
+        fn.argtypes = [wintypes.HWND, wintypes.DWORD]
+        fn.restype = wintypes.BOOL
+        return fn(hwnd, affinity)
+
+    def _apply_taskbar_hide(self):
+        """Remove the app from the Windows taskbar by setting WS_EX_TOOLWINDOW and clearing WS_EX_APPWINDOW.
+
+        This runs shortly after UI build to ensure the window exists and is hidden from taskbar/Alt-Tab when packaged.
+        """
+        if platform.system() != 'Windows':
+            return
+        try:
+            GWL_EXSTYLE = -20
+            WS_EX_APPWINDOW = 0x00040000
+            WS_EX_TOOLWINDOW = 0x00000080
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOZORDER = 0x0004
+            SWP_FRAMECHANGED = 0x0020
+
+            self.root.update_idletasks()
+            hwnd = self.root.winfo_id()
+            # ensure we operate on the top-level window
+            try:
+                hwnd = ctypes.windll.user32.GetAncestor(hwnd, 2)
+            except Exception:
+                pass
+
+            ex = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            # clear APPWINDOW and set TOOLWINDOW
+            ex = (ex & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex)
+            # refresh window frame so changes take effect
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
+        except Exception:
+            pass
+
+    def _hide_from_capture(self):
+        if platform.system() != "Windows":
+            return
+
+        winver = sys.getwindowsversion()
+        if winver.major < 10 or (winver.major == 10 and winver.build < 14393):
+            if not self._capture_error_logged:
+                self.log_message("system", "Capture protection unavailable: Windows version does not support screen-capture exclusion.")
+                self._capture_error_logged = True
+            return
+
+        try:
+            self.root.update_idletasks()
+            hwnd = self.root.winfo_id()
+            hwnd = ctypes.windll.user32.GetAncestor(hwnd, 2)
+            self._make_window_layered(hwnd)
+
+            if self._capture_affinity is None:
+                for affinity in (WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR):
+                    result = self._set_display_affinity(hwnd, affinity)
+                    if result:
+                        self._capture_affinity = affinity
+                        break
+                if self._capture_affinity is None:
+                    raise ctypes.WinError()
+            else:
+                result = self._set_display_affinity(hwnd, self._capture_affinity)
+                if not result:
+                    raise ctypes.WinError()
+        except Exception as exc:
+            if not self._capture_error_logged:
+                self.log_message("system", f"Capture protection unavailable: {exc}")
+                self._capture_error_logged = True
+        finally:
+            self.root.after(2000, self._hide_from_capture)
+
+    def start_recording(self):
+        # audio recording disabled in lightweight UI
+        self.log_message('system', 'Start recording disabled in lightweight capture mode.')
+
+    def stop_recording(self):
+        # audio recording disabled
+        self.log_message('system', 'Stop recording disabled in lightweight capture mode.')
+
+    def stop(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def _capture_loop(self):
+        # audio capture loop removed in lightweight UI
+        return
+
+    def send_prompt(self, event=None):
+        prompt = self.prompt_entry.get().strip()
+        if not prompt:
+            return
+
+        self.prompt_entry.delete(0, tk.END)
+        self.log_message("user", prompt)
+        self.send_button.config(state="disabled")
+
+        threading.Thread(target=self._send_prompt_thread, args=(prompt,), daemon=True).start()
+
+    def _send_prompt_thread(self, prompt: str):
+        try:
+            self.root.after(0, lambda: self.status_label.config(text="Answering now...", fg="#a6e22e"))
+            self.root.after(0, self._begin_assistant_stream)
+
+            # append default instruction to include example usage when code is returned
+            prompt_with_instr = prompt + ("\n\nAdditionally: if you include code in your response, append at least two short example usages showing how to call or run the code with concrete example values. Place these examples immediately after the code block and before the explanation. "
+                                           "Then add a brief interviewer-style explanation describing the design choices, complexity, and edge-cases handled.")
+            future = asyncio.run_coroutine_threadsafe(
+                self.ai.ask_gpt(prompt_with_instr, mode="chat", stream=True, on_delta=self._append_assistant_chunk),
+                self.loop,
+            )
+            # track current AI future so it can be cancelled if needed
+            self._current_ai_future = future
+            try:
+                # extended timeout to avoid truncated/early termination of streaming responses
+                future.result(timeout=300)
+            except Exception as exc:
+                self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Chat error: {type(exc).__name__}: {exc}'))
+            self.root.after(0, self._finish_assistant_stream)
+            try:
+                delattr(self, '_current_ai_future')
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Chat error: {type(exc).__name__}: {exc}'))
+            except Exception:
+                pass
+        finally:
+            self.root.after(0, lambda: self.send_button.config(state="normal"))
+            try:
+                self.root.after(0, lambda: self.status_label.config(text="Ready for the next prompt.", fg="#50fa7b"))
+            except Exception:
+                pass
+
+    def run(self):
+        """Run the Tkinter main loop for the overlay."""
+        self.root.mainloop()
+
+    def _configure_tesseract(self, pytesseract) -> bool:
+        """Ensure pytesseract points to a valid tesseract executable.
+
+        Returns True if configured, False otherwise.
+        """
+        # prefer explicit config, then environment, then common install path
+        tpath = None
+        try:
+            from config import TESSERACT_CMD
+            tpath = TESSERACT_CMD
+        except Exception:
+            tpath = None
+
+        if not tpath:
+            tpath = os.environ.get('TESSERACT_CMD') or os.environ.get('TESSERACT_PATH')
+
+        if tpath and os.path.exists(tpath):
+            pytesseract.pytesseract.tesseract_cmd = tpath
+            return True
+
+        # try default Windows install path
+        default = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        if os.path.exists(default):
+            pytesseract.pytesseract.tesseract_cmd = default
+            return True
+
+        return False
+
+    def capture_screen_and_answer(self):
+        """Capture the screen (image), OCR it to text, and send to the AI for an answer.
+
+        This runs the screenshot in a background thread, temporarily hides the overlay
+        so it is not captured, and re-shows it after grabbing. It then runs OCR and
+        schedules the forced send as usual.
+        """
+
+        # perform the screen grab on the main thread (via after) to avoid ImageGrab hanging
+        self.log_message('system', 'Starting full-screen capture...')
+        try:
+            from PIL import ImageGrab
+        except Exception:
+            self.log_message("system", "Capture failed: Pillow not installed. Install 'pillow' in the venv.")
+            return
+
+        # disable capture controls and hide overlay, then grab on the mainloop shortly after
+        try:
+            self.header_capture.config(state='disabled')
+            self.capture_button.config(state='disabled')
+        except Exception:
+            pass
+
+        def _grab_on_main():
+            # withdraw then grab immediately
+            try:
+                self.root.withdraw()
+            except Exception:
+                pass
+
+            try:
+                img = ImageGrab.grab(all_screens=True)
+            except Exception as exc:
+                self.log_message('system', f'Screenshot failed: {exc}')
+                img = None
+
+            try:
+                self.root.deiconify()
+            except Exception:
+                pass
+
+            try:
+                self.header_capture.config(state='normal')
+                self.capture_button.config(state='normal')
+            except Exception:
+                pass
+
+            if img is None:
+                return
+
+            # process OCR in background to avoid blocking UI
+            threading.Thread(target=self._process_captured_image, args=(img,), daemon=True).start()
+
+        # schedule grab after 150ms to allow withdraw to take effect
+        self.root.after(150, _grab_on_main)
+
+    # Region selection capture (faster): user draws a rectangle on screen
+    def start_region_selection(self):
+        sel = tk.Toplevel(self.root)
+        sel.attributes("-fullscreen", True)
+        sel.attributes("-alpha", 0.25)
+        sel.configure(bg="black")
+        sel.overrideredirect(True)
+
+        # Use the toplevel's background color (empty string isn't a valid color)
+        canvas = tk.Canvas(sel, cursor="cross", bg=sel.cget('bg'), highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+
+        start = {}
+        rect = None
+
+        def on_mouse_down(event):
+            start['x'] = event.x_root
+            start['y'] = event.y_root
+
+        def on_mouse_move(event):
+            nonlocal rect
+            # convert screen coordinates to canvas-local coordinates
+            x1, y1 = start.get('x', 0), start.get('y', 0)
+            x2, y2 = event.x_root, event.y_root
+            lx1 = x1 - sel.winfo_rootx()
+            ly1 = y1 - sel.winfo_rooty()
+            lx2 = x2 - sel.winfo_rootx()
+            ly2 = y2 - sel.winfo_rooty()
+            canvas.delete('selrect')
+            canvas.create_rectangle(lx1, ly1, lx2, ly2, outline='red', width=2, tag='selrect')
+
+        def on_mouse_up(event):
+            x1, y1 = start.get('x', 0), start.get('y', 0)
+            x2, y2 = event.x_root, event.y_root
+            sel.destroy()
+            bbox = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+            threading.Thread(target=self._capture_region_and_ask, args=(bbox,), daemon=True).start()
+
+        canvas.bind('<ButtonPress-1>', on_mouse_down)
+        canvas.bind('<B1-Motion>', on_mouse_move)
+        canvas.bind('<ButtonRelease-1>', on_mouse_up)
+
+    def _capture_region_and_ask(self, bbox):
+        try:
+            from PIL import ImageGrab, Image, ImageOps, ImageFilter
+            import pytesseract
+        except Exception as exc:
+            self.log_message('system', f'Capture failed: missing libs ({exc})')
+            return
+        try:
+            if not self._configure_tesseract(pytesseract):
+                self.log_message('system', 'OCR failed: tesseract is not installed or not in PATH. See TESSERACT_INSTALLATION.md')
+                return
+        except Exception:
+            pass
+
+        try:
+            img = ImageGrab.grab(bbox=bbox)
+        except Exception as exc:
+            self.log_message('system', f'Screenshot failed: {exc}')
+            return
+
+        try:
+            proc = self._preprocess_for_ocr(img)
+            text, chosen_psm = self._ocr_best_psm(proc, pytesseract, psm_list=[6,3,11,1])
+            self.log_message('system', f'OCR used psm={chosen_psm}')
+        except Exception as exc:
+            self.log_message('system', f'OCR failed: {exc}')
+            return
+
+        if not text or not text.strip():
+            self.log_message('system', 'No text detected in selected region.')
+            return
+
+        # Log OCR text and schedule forced send
+        self.log_message('system', 'Captured OCR text:')
+        self.log_message('system', text)
+        self._capture_cancelled = False
+        try:
+            self.cancel_send_button.config(state='normal')
+        except Exception:
+            pass
+        if self._pending_auto_send_id:
+            try:
+                self.root.after_cancel(self._pending_auto_send_id)
+            except Exception:
+                pass
+        self._pending_auto_send_id = self.root.after(2000, lambda: threading.Thread(target=self._auto_send_forced, args=(text,), daemon=True).start())
+
+    def _cancel_pending_capture(self):
+        try:
+            self._capture_cancelled = True
+            if self._pending_auto_send_id:
+                try:
+                    self.root.after_cancel(self._pending_auto_send_id)
+                except Exception:
+                    pass
+                self._pending_auto_send_id = None
+            try:
+                self.cancel_send_button.config(state='disabled')
+            except Exception:
+                pass
+            self.log_message('system', 'Capture send cancelled by user.')
+        except Exception:
+            pass
+
+    def _auto_send_forced(self, text: str):
+        # Runs in background thread
+        try:
+            if getattr(self, '_capture_cancelled', False):
+                return
+            # disable cancel button in UI
+            self.root.after(0, lambda: self.cancel_send_button.config(state='disabled'))
+            # clear pending id
+            self._pending_auto_send_id = None
+            lang = getattr(self, 'lang_var', None).get() if getattr(self, 'lang_var', None) else 'Python'
+            forced = (
+                f"Treat the captured text as a coding interview task. Extract any candidate problem statement or examples and produce a concise, runnable {lang} solution. "
+                "If nothing explicit exists, make a reasonable assumption about the intended problem and provide a minimal solution.\n\n"
+                "Captured text:\n" + text + (
+                    f"\n\nAdditionally: whenever you include code in your response, annotate each line of the code with a short, human-sounding comment explaining what that line does. Use conversational, natural language (not robotic) and the target language's single-line comment syntax (for example, '//' for Java/C-like languages or '#' for Python). Place comments inline when feasible. Respond using {lang} code blocks where applicable. Also include at least two short example usages demonstrating how to call or run the code with concrete values; place these examples immediately after the code block and before the explanation. Then provide a concise interviewer-style explanation of your choices, complexity, and edge-cases."
+                )
+            )
+            # start streaming
+            self.root.after(0, self._begin_assistant_stream)
+            future = asyncio.run_coroutine_threadsafe(
+                self.ai.ask_gpt(forced, mode="chat", stream=True, on_delta=self._append_assistant_chunk, fast=True),
+                self.loop,
+            )
+            self._current_ai_future = future
+            try:
+                # extended timeout for capture-triggered requests
+                future.result(timeout=300)
+            except Exception as exc:
+                self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Auto-send error: {type(exc).__name__}: {exc}'))
+            finally:
+                self.root.after(0, self._finish_assistant_stream)
+                try:
+                    delattr(self, '_current_ai_future')
+                except Exception:
+                    pass
+        except Exception as exc:
+            try:
+                self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Auto-send unexpected error: {type(exc).__name__}: {exc}'))
+            except Exception:
+                pass
+
+    def _capture_ask_thread(self, prompt: str):
+        try:
+            self.root.after(0, self._begin_assistant_stream)
+            future = asyncio.run_coroutine_threadsafe(
+                self.ai.ask_gpt(prompt, mode="chat", stream=True, on_delta=self._append_assistant_chunk, fast=True),
+                self.loop,
+            )
+            self._current_ai_future = future
+            response = future.result(timeout=90)
+            if not response:
+                self.root.after(0, lambda: self.log_message("assistant", "No response received."))
+            else:
+                # if assistant explicitly said NOT_FOUND, do one forced attempt to interpret anyway
+                try:
+                    first_line = response.strip().splitlines()[0] if response.strip() else ""
+                except Exception:
+                    first_line = ""
+                if first_line.startswith("NOT_FOUND"):
+                    # build a forced prompt to coerce a best-effort solution
+                    forced = (
+                        "The assistant previously reported NOT_FOUND. Now, regardless of that, treat the captured text as if it may contain a coding task. "
+                        "Extract any candidate problem statement or example and produce a concise, runnable Python solution. "
+                        "If nothing explicit exists, make a reasonable assumption about the intended problem and provide a minimal solution.\n\n"
+                        "Captured text:\n" + prompt + (
+                                "\n\nAdditionally: whenever you include code in your response, annotate each line of the code with a short, human-sounding comment explaining what that line does. Use conversational, natural language (not robotic) and the target language's single-line comment syntax (e.g. '#' for Python). Place comments inline when feasible. Also include at least two short example usages demonstrating how to run or call the code with concrete values; place these examples immediately after the code block and before the explanation. Then provide a concise interviewer-style explanation of your choices, complexity, and edge-cases."
+                        )
+                    )
+                    # append a separator so the UI stream is distinct
+                    self.root.after(0, lambda: self.log_message('system', 'Assistant reported NOT_FOUND — forcing a best-effort solution...'))
+                    future2 = asyncio.run_coroutine_threadsafe(
+                        self.ai.ask_gpt(forced, mode="chat", stream=True, on_delta=self._append_assistant_chunk, fast=True),
+                        self.loop,
+                    )
+                    self._current_ai_future = future2
+                    try:
+                        future2.result(timeout=90)
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            delattr(self, '_current_ai_future')
+                        except Exception:
+                            pass
+            self.root.after(0, self._finish_assistant_stream)
+            try:
+                delattr(self, '_current_ai_future')
+            except Exception:
+                pass
+        except Exception as exc:
+            self.root.after(0, lambda exc=exc: self.log_message("assistant", f"Capture chat error: {type(exc).__name__}: {exc}"))
+        finally:
+            self.root.after(0, lambda: self.status_label.config(text="Ready for the next prompt.", fg="#50fa7b"))
+
+    def _toggle_listen(self):
+        if not self._listening:
+            self._start_live_listen()
+        else:
+            self._stop_live_listen()
+
+    def _test_mic(self):
+        import sounddevice as sd
+        import numpy as _np
+        import wave
+        import tempfile
+        try:
+            tmp = Path(tempfile.gettempdir()) / f"mic_test_{int(time.time()*1000)}.wav"
+            sr = getattr(self.recorder, 'samplerate', 16000)
+            ch = getattr(self.recorder, 'channels', 1)
+            dev = None
+            try:
+                sel = self.device_var.get()
+                dev = int(sel) if sel else None
+            except Exception:
+                dev = None
+            # adapt to device defaults when possible
+            try:
+                if dev is not None:
+                    info = sd.query_devices(dev)
+                    sr = int(info.get('default_samplerate', sr))
+                    max_in = int(info.get('max_input_channels', ch) or ch)
+                    ch = min(ch, max_in) if max_in > 0 else ch
+                else:
+                    # use default input device
+                    dd = sd.default.device
+                    idx = None
+                    if isinstance(dd, (list, tuple)):
+                        idx = dd[0]
+                    else:
+                        idx = dd
+                    try:
+                        info = sd.query_devices(idx)
+                        sr = int(info.get('default_samplerate', sr))
+                        max_in = int(info.get('max_input_channels', ch) or ch)
+                        ch = min(ch, max_in) if max_in > 0 else ch
+                        dev = idx
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            frames = int(sr * 1.0)
+            try:
+                if dev is not None:
+                    rec = sd.rec(frames, samplerate=sr, channels=ch, dtype='int16', device=dev)
+                else:
+                    rec = sd.rec(frames, samplerate=sr, channels=ch, dtype='int16')
+            except Exception as e:
+                # fallback: try common rates
+                for try_sr in (44100, 48000, 16000):
+                    try:
+                        sr = try_sr
+                        frames = int(sr * 1.0)
+                        if dev is not None:
+                            rec = sd.rec(frames, samplerate=sr, channels=ch, dtype='int16', device=dev)
+                        else:
+                            rec = sd.rec(frames, samplerate=sr, channels=ch, dtype='int16')
+                        break
+                    except Exception:
+                        rec = None
+                        continue
+                if rec is None:
+                    raise
+            sd.wait()
+            arr = _np.frombuffer(rec.tobytes(), dtype=_np.int16)
+            rms = float(_np.sqrt(_np.mean((arr.astype('float32') / 32768.0) ** 2))) if arr.size else 0.0
+            self.log_message('system', f'Mic test RMS={rms:.4f} (device={dev})')
+            try:
+                with wave.open(str(tmp), 'wb') as wf:
+                    wf.setnchannels(ch)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sr)
+                    wf.writeframes(rec.tobytes())
+            except Exception:
+                pass
+        except Exception as exc:
+            self.log_message('system', f'Mic test failed: {exc}')
+
+    def _start_live_listen(self):
+        try:
+            # start recorder if not running
+            self._live_stop_event.clear()
+            self._live_last_transcript = ""
+            # pick device from menu if present
+            try:
+                sel = self.device_var.get()
+                self._selected_device = int(sel) if sel else None
+            except Exception:
+                self._selected_device = None
+
+            self._listening = True
+            try:
+                self.mic_button.config(bg="#ff4444")
+            except Exception:
+                pass
+            self.log_message('system', 'Live listening started...')
+            # Start a thread that will probe devices if necessary and then run the live loop
+            self._live_thread = threading.Thread(target=self._select_and_start_live, daemon=True)
+            self._live_thread.start()
+        except Exception as exc:
+            self.log_message('system', f'Live listen failed: {exc}')
+
+    def _probe_single_device(self, device_idx, duration=0.6, try_srs=(16000, 44100, 48000)):
+        """Record a short snippet from a single device and return (rms, samplerate) or (0.0, None) on failure."""
+        try:
+            import sounddevice as sd
+            import numpy as _np
+        except Exception:
+            return 0.0, None
+
+        try:
+            info = sd.query_devices(int(device_idx))
+        except Exception:
+            return 0.0, None
+
+        # Build ordered list of sample rates: prefer device default first
+        default_sr = None
+        try:
+            default_sr = int(info.get('default_samplerate'))
+        except Exception:
+            default_sr = None
+
+        srs = []
+        if default_sr:
+            srs.append(default_sr)
+        for sr in try_srs:
+            try:
+                if sr in srs:
+                    # already included
+                    pass
+                else:
+                    srs.append(sr)
+            except Exception:
+                continue
+
+        for sr in srs:
+            try:
+                ch = int(info.get('max_input_channels', 1) or 1)
+                frames = int(sr * duration)
+                rec = sd.rec(frames, samplerate=sr, channels=min(ch, 1), dtype='int16', device=int(device_idx))
+                sd.wait(timeout=int(duration * 1000) + 500)
+                import numpy as np
+                arr = np.frombuffer(rec.tobytes(), dtype=np.int16)
+                if arr.size:
+                    rms = float(np.sqrt(np.mean((arr.astype('float32') / 32768.0) ** 2)))
+                else:
+                    rms = 0.0
+                return rms, sr
+            except Exception:
+                continue
+        return 0.0, None
+
+    def _auto_select_working_device(self, duration=0.6, threshold=0.002):
+        """Iterate input-capable devices and return first (index, rms) above threshold, or (None, 0.0)."""
+        try:
+            import sounddevice as sd
+            import numpy as _np
+        except Exception:
+            return None, 0.0
+
+        try:
+            devs = sd.query_devices()
+        except Exception:
+            return None, 0.0
+
+        # gather candidate indices (input-capable)
+        candidates = [i for i, d in enumerate(devs) if d.get('max_input_channels', 0) > 0]
+        # prefer devices listed in the UI menu first
+        try:
+            pref = [int(k) for k in getattr(self, '_device_map', {}).keys()]
+            for p in reversed(pref):
+                if p in candidates:
+                    candidates.remove(p)
+                    candidates.insert(0, p)
+        except Exception:
+            pass
+
+        # Probe each candidate and pick the one with the highest RMS
+        best_idx = None
+        best_rms = 0.0
+        for idx in candidates:
+            try:
+                rms, sr = self._probe_single_device(idx, duration=duration)
+                if rms and rms > best_rms:
+                    best_rms = rms
+                    best_idx = idx
+            except Exception:
+                continue
+
+        # Accept any device with a small but non-zero RMS (handles low-gain mics)
+        min_accept = 1e-5
+        if best_idx is not None and best_rms >= min_accept:
+            return best_idx, best_rms
+
+        return None, 0.0
+
+    def _select_and_start_live(self):
+        """Background thread entry: ensure a working input device is selected, then run the live loop."""
+        # prefer explicit UI selection
+        try:
+            sel = getattr(self, '_selected_device', None)
+        except Exception:
+            sel = None
+
+        chosen = None
+        if sel is not None:
+            try:
+                rms, sr = self._probe_single_device(sel)
+                if rms and rms > 0.0015:
+                    chosen = sel
+            except Exception:
+                chosen = None
+
+        if chosen is None:
+            idx, rms = self._auto_select_working_device()
+            if idx is not None:
+                chosen = idx
+                try:
+                    self.root.after(0, lambda: self.log_message('system', f'Auto-selected device {idx} (rms={rms:.4f})'))
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.root.after(0, lambda: self.log_message('system', 'No working input device found. Check microphone permissions and device selection.'))
+                except Exception:
+                    pass
+
+        # set chosen device for the live loop
+        try:
+            self._selected_device = chosen
+        except Exception:
+            pass
+
+        # set sounddevice default to the chosen device so rec uses it reliably
+        try:
+            import sounddevice as _sd
+            if chosen is not None:
+                try:
+                    _sd.default.device = chosen
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # run the live transcript loop (it will handle None device cases)
+        try:
+            self._live_transcribe_loop()
+        except Exception:
+            pass
+
+        # persist chosen device to config for next runs
+        try:
+            if chosen is not None:
+                cfg_path = os.path.join(os.path.dirname(__file__), 'config.py')
+                # read existing config
+                try:
+                    with open(cfg_path, 'r', encoding='utf-8') as f:
+                        lines = f.readlines()
+                except Exception:
+                    lines = []
+                out = []
+                found = False
+                for ln in lines:
+                    if ln.strip().startswith('DEFAULT_MIC_DEVICE'):
+                        out.append(f'DEFAULT_MIC_DEVICE = {repr(chosen)}\n')
+                        found = True
+                    else:
+                        out.append(ln)
+                if not found:
+                    out.append('\n# persisted by UI auto-select\n')
+                    out.append(f'DEFAULT_MIC_DEVICE = {repr(chosen)}\n')
+                try:
+                    with open(cfg_path, 'w', encoding='utf-8') as f:
+                        f.writelines(out)
+                    self.root.after(0, lambda: self.log_message('system', f'Persisted DEFAULT_MIC_DEVICE={chosen} to config.py'))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _stop_live_listen(self):
+        try:
+            self._live_stop_event.set()
+            self._listening = False
+            try:
+                self.mic_button.config(bg="#333333")
+            except Exception:
+                pass
+            # stop recorder (writer finishes)
+            self.recorder.stop()
+            self.log_message('system', 'Live listening stopped.')
+            # ensure thread joined briefly
+            if self._live_thread is not None:
+                self._live_thread.join(timeout=1)
+            # send the full accumulated transcript on stop (conversation mode)
+            final = (self._live_last_transcript or "").strip()
+            if final:
+                self.root.after(0, lambda: self.prompt_entry.delete(0, tk.END))
+                self.root.after(0, lambda txt=final: self.prompt_entry.insert(0, txt))
+                # send automatically the full conversation transcript
+                threading.Thread(target=self._send_prompt_thread, args=(final,), daemon=True).start()
+        except Exception as exc:
+            self.log_message('system', f'Error stopping live listen: {exc}')
+
+    def _live_transcribe_loop(self):
+        """Background loop: periodically transcribe the recorder WAV and stream incremental words to the UI."""
+        import tempfile
+        import sounddevice as sd
+        import numpy as np
+        import wave
+
+        samplerate = getattr(self.recorder, 'samplerate', 16000)
+        channels = getattr(self.recorder, 'channels', 1)
+        device = getattr(self.recorder, 'device', None)
+        # prefer explicit selection from UI if present
+        try:
+            sel = getattr(self, '_selected_device', None)
+            if sel is None:
+                sel = None
+        except Exception:
+            sel = None
+        if sel is not None:
+            device = sel
+        # use longer chunks for more stable ASR results
+        chunk_seconds = 2.4
+        # minimum characters in a transcription chunk before emitting incremental UI updates
+        min_trans_chars = 6
+        last = ""
+        # debug: report device info
+        try:
+            # log chosen device index and name/details
+            try:
+                dev_info = sd.query_devices(device) if device is not None else sd.query_devices()
+                name = dev_info.get('name') if isinstance(dev_info, dict) else str(dev_info)
+                max_in = dev_info.get('max_input_channels', 'unknown') if isinstance(dev_info, dict) else 'unknown'
+            except Exception:
+                name = str(device)
+                max_in = 'unknown'
+            self.root.after(0, lambda: self.log_message('system', f'Live recorder device={device} ({name}), max_input_channels={max_in}, samplerate={samplerate}, channels={channels}'))
+        except Exception:
+            pass
+
+        while not self._live_stop_event.is_set():
+            try:
+                # record a short chunk directly from the input device
+                frames = int(samplerate * chunk_seconds)
+                try:
+                    # ensure we have a valid input device; if not, pick the first input-capable device
+                    use_device = device
+                    try:
+                        if use_device is None:
+                            dd = sd.default.device
+                            if isinstance(dd, (list, tuple)):
+                                use_device = dd[0]
+                            else:
+                                use_device = dd
+                        info = sd.query_devices(use_device)
+                        if info.get('max_input_channels', 0) <= 0:
+                            # find first input-capable device
+                            for i, d in enumerate(sd.query_devices()):
+                                if d.get('max_input_channels', 0) > 0:
+                                    use_device = i
+                                    info = d
+                                    break
+                    except Exception:
+                        use_device = None
+
+                    # adapt samplerate/channels to the chosen device
+                    try:
+                        if use_device is not None:
+                            dinfo = sd.query_devices(use_device)
+                            dsr = int(dinfo.get('default_samplerate', samplerate))
+                            dch = int(dinfo.get('max_input_channels', channels) or channels)
+                            use_sr = dsr
+                            use_ch = min(channels, dch) if dch > 0 else channels
+                        else:
+                            use_sr = samplerate
+                            use_ch = channels
+                    except Exception:
+                        use_sr = samplerate
+                        use_ch = channels
+
+                    if use_device is None:
+                        rec = sd.rec(frames, samplerate=use_sr, channels=use_ch, dtype='int16')
+                    else:
+                        try:
+                            rec = sd.rec(frames, samplerate=use_sr, channels=use_ch, dtype='int16', device=use_device)
+                        except Exception:
+                            # try common fallback rates
+                            rec = None
+                            for try_sr in (44100, 48000, 16000):
+                                try:
+                                    rec = sd.rec(frames, samplerate=try_sr, channels=use_ch, dtype='int16', device=use_device)
+                                    use_sr = try_sr
+                                    break
+                                except Exception:
+                                    rec = None
+                                    continue
+                            if rec is None:
+                                raise
+                    sd.wait()
+                except Exception as e:
+                    self.root.after(0, lambda: self.log_message('system', f'Audio capture error: {e}'))
+                    time.sleep(0.8)
+                    continue
+
+                # write to temp wav
+                tmp_path = Path(tempfile.gettempdir()) / f"live_chunk_{int(time.time()*1000)}.wav"
+                try:
+                    with wave.open(str(tmp_path), 'wb') as wf:
+                        wf.setnchannels(channels)
+                        wf.setsampwidth(2)
+                        wf.setframerate(samplerate)
+                        wf.writeframes(rec.tobytes())
+                except Exception:
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
+                    time.sleep(0.6)
+                    continue
+
+                # call async transcribe on the short chunk
+                text = ""
+                try:
+                    future = asyncio.run_coroutine_threadsafe(self.ai.transcribe(str(tmp_path)), self.loop)
+                    text = (future.result(timeout=10) or "").strip()
+                except Exception:
+                    text = ""
+
+                # if remote transcription is empty or too short, try local Vosk fallback
+                if not text or len(text.strip()) < 6:
+                    # local ASR fallback removed — rely on remote transcription only
+                    try:
+                        self.root.after(0, lambda: self.log_message('system', 'No local ASR available; skipping fallback.'))
+                    except Exception:
+                        pass
+
+                # cleanup temp file
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+
+                # if transcription empty, skip
+                if not text:
+                    time.sleep(0.2)
+                    continue
+
+                # normalize whitespace
+                text_norm = ' '.join(text.split())
+
+                # ignore very short transcriptions (likely noise or single words)
+                if len(text_norm) < min_trans_chars:
+                    try:
+                        self.root.after(0, lambda: self.log_message('system', f'Skipped short transcription (len={len(text_norm)})'))
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                    continue
+
+                # debug: compute RMS of recorded chunk
+                try:
+                    import numpy as _np
+                    arr = _np.frombuffer(rec.tobytes(), dtype=_np.int16)
+                    if arr.size:
+                        rms = float(_np.sqrt(_np.mean((arr.astype('float32') / 32768.0) ** 2)))
+                    else:
+                        rms = 0.0
+                except Exception:
+                    rms = 0.0
+                try:
+                    self.root.after(0, lambda rms=rms: self.log_message('system', f'Chunk RMS={rms:.4f}, transcribed_len={len(text_norm)}'))
+                except Exception:
+                    pass
+
+                # compute new words relative to last transcript
+                if last and text_norm.startswith(last):
+                    diff = text_norm[len(last):].strip()
+                elif last and last in text_norm:
+                    diff = text_norm.split(last, 1)[1].strip()
+                else:
+                    # big change, consider entire text as new
+                    diff = text_norm
+
+                last = text_norm
+                self._live_last_transcript = text_norm
+
+                if not diff:
+                    time.sleep(0.1)
+                    continue
+
+                # split into words and emit only substantive tokens
+                words = [w for w in diff.split() if len(w.strip(".,!?()[]{}\"'`")) > 1]
+                if not words:
+                    time.sleep(0.1)
+                    continue
+
+                new_chunk = ' '.join(words)
+
+                def emit_chunk(c=new_chunk):
+                    try:
+                        cur = self.prompt_entry.get()
+                        if cur and not cur.endswith(' '):
+                            cur = cur + ' '
+                        self.prompt_entry.delete(0, tk.END)
+                        self.prompt_entry.insert(0, (cur + c).strip())
+                    except Exception:
+                        pass
+                    # log the incremental words once
+                    self.log_message('user', c)
+
+                self.root.after(0, emit_chunk)
+
+            except Exception:
+                pass
+            finally:
+                time.sleep(0.15)
+
+    def log_message(self, role: str, message: str):
+        tag = "user" if role == "user" else "assistant" if role == "assistant" else "system"
+        prefix = "You: " if role == "user" else "Assistant: " if role == "assistant" else "Info: "
+
+        def append():
+            start_index = self.log.index(tk.END)
+            self.log.insert(tk.END, f"{prefix}{message}\n", tag)
+            if role == "assistant":
+                self.log.see(start_index)
+            else:
+                self.log.see(tk.END)
+
+        self.root.after(0, append)
+
+    def run(self):
+        self.root.mainloop()
+
+    def _show_ocr_preview(self):
+        """Show a small dialog with OCR text and options: Send, Retry (different PSM), Cancel."""
+        data = getattr(self, '_last_ocr', None)
+        if not data:
+            return
+
+        preview = tk.Toplevel(self.root)
+        preview.title('OCR Preview')
+        preview.geometry('640x360')
+        preview.transient(self.root)
+
+        text_box = tk.Text(preview, wrap='word')
+        text_box.pack(fill='both', expand=True, padx=8, pady=8)
+        text_box.insert('1.0', data['text'])
+
+        btn_frame = tk.Frame(preview)
+        btn_frame.pack(fill='x', pady=(0,8))
+
+        def do_send():
+            lang = getattr(self, 'lang_var', None).get() if getattr(self, 'lang_var', None) else 'Python'
+            user_prompt = (
+                "Act as a coding-interview assistant. Analyze the captured screen text and determine whether it contains a coding interview question or prompt. "
+                "Respond using one of the two exact formats below (no extra commentary):\n\n"
+                "If a coding question is present, reply exactly as:\n"
+                "FOUND\n\n"
+                "<Problem statement (concise)>\n\n"
+                f"```{lang.lower()}\n<code solution>\n```\n\n"
+                "If no coding question is present, reply exactly as:\n"
+                "NOT_FOUND\n\n"
+                "<one-line explanation why not>\n\n"
+                f"Always prefer {lang} for solutions. Make code runnable and minimal. Now analyze the following captured text:\n\n"
+                "Captured text:\n" + text_box.get('1.0', tk.END)
+            )
+            # ensure example usage is requested when assistant provides code
+            user_prompt += "\n\nAdditionally: whenever you include code in your response, please append at least two short example usages showing how to call or run the code with concrete values; place these examples immediately after the code block and before the explanation, and then provide a brief interviewer-style explanation describing why you chose this approach and what edge-cases/complexity you considered."
+            preview.destroy()
+            self.log_message('system', 'Captured region; sending to AI...')
+            threading.Thread(target=self._capture_ask_thread, args=(user_prompt,), daemon=True).start()
+
+        def do_retry():
+            # cycle to next PSM and rerun OCR
+            idx = (data.get('psm_index', 0) + 1) % len(data['psm_list'])
+            data['psm_index'] = idx
+            psm = data['psm_list'][idx]
+            try:
+                import pytesseract
+                custom = fr'--oem 1 --psm {psm}'
+                new_text = pytesseract.image_to_string(data['img'], config=custom)
+                data['text'] = new_text
+                text_box.delete('1.0', tk.END)
+                text_box.insert('1.0', new_text)
+                self.log_message('system', f'Retried OCR with psm={psm}')
+            except Exception as exc:
+                self.log_message('system', f'OCR retry failed: {exc}')
+
+        def do_cancel():
+            preview.destroy()
+
+        send_btn = tk.Button(btn_frame, text='Send', command=do_send, bg='#44b94e', fg='white')
+        send_btn.pack(side='left', padx=6)
+        retry_btn = tk.Button(btn_frame, text='Retry OCR (try other PSM)', command=do_retry, bg='#ffaa00')
+        retry_btn.pack(side='left', padx=6)
+        cancel_btn = tk.Button(btn_frame, text='Cancel', command=do_cancel, bg='#666666', fg='white')
+        cancel_btn.pack(side='right', padx=6)
+
+    def _preprocess_for_ocr(self, img):
+        """Create several preprocessing variants for OCR to improve robustness.
+
+        Returns a list of PIL images to try.
+        Variants: grayscale+autocontrast, sharpened, binarized, inverted, small rotations to correct skew.
+        """
+        try:
+            from PIL import ImageOps, ImageFilter, Image
+        except Exception:
+            return [img]
+
+        ims = []
+        base = img.convert('L')
+        base = ImageOps.autocontrast(base)
+        base = base.filter(ImageFilter.MedianFilter(size=3))
+        try:
+            base = base.resize((int(base.width * 1.5), int(base.height * 1.5)), Image.LANCZOS)
+        except Exception:
+            pass
+        ims.append(base)
+
+        # sharpened
+        try:
+            sh = base.filter(ImageFilter.SHARPEN)
+            ims.append(sh)
+        except Exception:
+            pass
+
+        # binarized (simple threshold) and inverted
+        try:
+            bw = base.point(lambda p: 255 if p > 140 else 0).convert('L')
+            ims.append(bw)
+            inv = ImageOps.invert(bw)
+            ims.append(inv)
+        except Exception:
+            pass
+
+        # try small rotations to correct skew
+        angles = (-2, 0, 2)
+        for a in angles:
+            if a == 0:
+                continue
+            try:
+                rot = base.rotate(a, expand=True)
+                ims.append(rot)
+            except Exception:
+                pass
+
+        # ensure uniqueness order preserved
+        seen = []
+        out = []
+        for im in ims:
+            key = (im.width, im.height)
+            if key in seen:
+                out.append(im)
+            else:
+                out.append(im)
+                seen.append(key)
+        return out
+
+    def _ocr_best_psm(self, imgs, pytesseract, psm_list=(6,3,11,1)):
+        """Try multiple preprocessed images and multiple PSMs; return the best-scoring text and psm.
+
+        imgs: list of PIL images
+        Returns (text, chosen_psm)
+        """
+        best = ('', None, -1)
+        for im in imgs:
+            for psm in psm_list:
+                try:
+                    cfg = fr'--oem 1 --psm {psm}'
+                    txt = pytesseract.image_to_string(im, config=cfg)
+                except Exception:
+                    continue
+                score = self._code_likelihood_score(txt)
+                # small bonus for longer results to avoid empty short strings
+                score += min(len(txt) // 50, 5)
+                if score > best[2]:
+                    best = (txt, psm, score)
+        if best[1] is None:
+            return ('', psm_list[0])
+        return (best[0], best[1])
+
+    def _process_captured_image(self, img):
+        """Background processing of a captured PIL image: OCR, logging, and scheduling send."""
+        try:
+            import pytesseract
+        except Exception:
+            self.root.after(0, lambda: self.log_message("system", "Capture failed: pytesseract not available. Install 'pytesseract' and ensure Tesseract OCR is installed on your system."))
+            return
+
+        try:
+            if not self._configure_tesseract(pytesseract):
+                self.root.after(0, lambda: self.log_message("system", "OCR failed: tesseract is not installed or not in PATH. See TESSERACT_INSTALLATION.md"))
+                return
+        except Exception:
+            pass
+
+        try:
+            # Quick OCR fast-path: lightweight preprocessing and single PSM for minimal latency
+            try:
+                from PIL import ImageOps, Image
+                quick = img.convert('L')
+                quick = ImageOps.autocontrast(quick)
+                try:
+                    quick = quick.resize((int(quick.width * 1.2), int(quick.height * 1.2)), Image.LANCZOS)
+                except Exception:
+                    pass
+                cfg = r'--oem 1 --psm 6'
+                quick_txt = pytesseract.image_to_string(quick, config=cfg)
+            except Exception:
+                quick_txt = ''
+
+            # Decide whether quick OCR is sufficient: require some alphanumeric density
+            import re
+            def _alnum_count(s: str) -> int:
+                return len(re.findall(r"[A-Za-z0-9]", s or ""))
+
+            if quick_txt and quick_txt.strip() and _alnum_count(quick_txt) >= 8:
+                # quick result appears reasonably dense; accept for low latency
+                text = quick_txt
+                chosen_psm = 6
+                self.root.after(0, lambda: self.log_message('system', f'Quick OCR used psm={chosen_psm}'))
+            else:
+                proc_imgs = self._preprocess_for_ocr(img)
+                text, chosen_psm = self._ocr_best_psm(proc_imgs, pytesseract, psm_list=[6, 3, 11, 1])
+                self.root.after(0, lambda: self.log_message('system', f'OCR used psm={chosen_psm}'))
+        except Exception as exc:
+            self.root.after(0, lambda: self.log_message("system", f"OCR failed: {exc}"))
+            return
+
+        if not text or not text.strip():
+            self.root.after(0, lambda: self.log_message('system', 'No text detected on screen.'))
+            return
+
+        # Log OCR text in main log and immediately send to AI for fast response
+        self.root.after(0, lambda: self.log_message('system', 'Captured OCR text:'))
+        self.root.after(0, lambda: self.log_message('system', text))
+
+        # Build forced prompt for coding-interview interpretation (concise, runnable Python)
+        forced = (
+            "Treat the captured text as a coding interview task. Extract any candidate problem statement or examples and produce a concise, runnable Python solution. "
+            "If nothing explicit exists, make a reasonable assumption about the intended problem and provide a minimal solution.\n\n"
+            "Captured text:\n" + text + (
+                "\n\nAdditionally: whenever you include code in your response, annotate each line of the code with a short, human-sounding comment explaining what that line does. Use conversational, natural language (not robotic) and the target language's single-line comment syntax (e.g. '#' for Python). Place comments inline when feasible."
+            )
+        )
+
+        # start streaming response into UI with minimal latency
+        try:
+            self.root.after(0, lambda: self.status_label.config(text="Answering now...", fg="#a6e22e"))
+        except Exception:
+            pass
+        try:
+            self.root.after(0, self._begin_assistant_stream)
+        except Exception:
+            pass
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.ai.ask_gpt(forced, mode="chat", stream=True, on_delta=self._append_assistant_chunk, fast=True),
+                self.loop,
+            )
+            try:
+                future.result(timeout=120)
+            except Exception as exc:
+                self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Auto-send error: {type(exc).__name__}: {exc}'))
+        except Exception as exc:
+            self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Auto-send failed: {exc}'))
+        finally:
+            try:
+                self.root.after(0, self._finish_assistant_stream)
+            except Exception:
+                pass
+            try:
+                self.root.after(0, lambda: self.status_label.config(text="Ready for the next prompt.", fg="#50fa7b"))
+            except Exception:
+                pass
+
+    def _code_likelihood_score(self, text: str) -> int:
+        """Heuristic scoring for how code-like OCR output is.
+
+        Counts occurrences of code tokens and symbols.
+        """
+        if not text:
+            return 0
+        s = 0
+        low = text.lower()
+        keywords = ['def ', 'class ', 'import ', 'return ', 'if ', 'else:', 'elif ', 'for ', 'while ', 'lambda']
+        symbols = ['(', ')', ':', '=', '->', '[', ']', '{', '}', '#']
+        for kw in keywords:
+            s += low.count(kw) * 5
+        for sym in symbols:
+            s += text.count(sym)
+        # presence of '```' boosts score
+        if '```' in text:
+            s += 20
+        # penalize very short outputs
+        if len(text.strip()) < 20:
+            s -= 5
+        return s 
+
+
+
+
