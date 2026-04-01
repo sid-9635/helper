@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Callable
 from ai_bridge import AIBridge
 from database import Database
+try:
+    from live_listen import LiveInterviewListener
+except Exception:
+    LiveInterviewListener = None
 
 WDA_MONITOR = 1
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
@@ -45,6 +49,9 @@ class OverlayApp:
             asyncio.run_coroutine_threadsafe(self.ai._ensure_session(), self.loop)
         except Exception:
             pass
+
+        # interview listener (created on demand)
+        self._listener = None
 
         self._build_ui()
         # apply taskbar-hide styles shortly after UI is built (Windows only)
@@ -125,8 +132,8 @@ class OverlayApp:
         except Exception:
             pass
         # reduce inter-line spacing to make the log denser; darken assistant yellow
-        self.log.tag_configure("user", foreground="#8be9fd", background="#1b1d2a", spacing1=1, spacing3=2)
-        self.log.tag_configure("assistant", foreground="#caa300", background="#282a36", spacing1=1, spacing3=2)
+        self.log.tag_configure("user", foreground="#b8860b", background="#1b1d2a", spacing1=1, spacing3=2)
+        self.log.tag_configure("assistant", foreground="#50fa7b", background="#282a36", spacing1=1, spacing3=2)
         self.log.tag_configure("system", foreground="#50fa7b", background="#111111", spacing1=1, spacing3=2)
         self.log.pack(padx=6, fill="both", expand=True)
         self.log.bind("<Control-c>", self.copy_selection)
@@ -159,7 +166,7 @@ class OverlayApp:
         
         # language selection dropdown (default: Python)
         self.lang_var = tk.StringVar(value="Python")
-        lang_options = ["Python", "Java", "JavaScript", "C++", "C#", "Go", "Ruby"]
+        lang_options = ["Python", "TypeScript", "Java", "JavaScript", "C++", "C#", "Go", "Ruby"]
         try:
             lang_menu = tk.OptionMenu(prompt_frame, self.lang_var, *lang_options, command=self._on_lang_change)
             lang_menu.config(bg="#222222", fg="white", relief="flat")
@@ -179,6 +186,31 @@ class OverlayApp:
             relief="flat"
         )
         self.send_button.pack(side="left", padx=(6, 0))
+
+        # Mic toggle for interview listening (non-disruptive)
+        try:
+            self.listener_button = tk.Button(
+                prompt_frame,
+                text="Mic",
+                command=self._toggle_listener,
+                width=8,
+                bg="#333333",
+                fg="white",
+                relief="flat"
+            )
+            self.listener_button.pack(side="left", padx=6)
+            # compact status label — shows rms/flushing without touching the log
+            self._listener_status_lbl = tk.Label(
+                prompt_frame,
+                text="",
+                bg="#111111",
+                fg="#666666",
+                font=("Consolas", 8),
+                anchor="w",
+            )
+            self._listener_status_lbl.pack(side="left", padx=(0, 6), fill="x")
+        except Exception:
+            pass
 
         button_frame = tk.Frame(self.root, bg="#111111")
         button_frame.pack(pady=6)
@@ -482,6 +514,83 @@ class OverlayApp:
         except Exception:
             # fallback: run immediately
             _schedule()
+
+    # ----------------- Interview listener callbacks -----------------
+    def _on_listener_transcript(self, transcript: str):
+        try:
+            # show short transcript as a 'user' message
+            self.root.after(0, lambda: self.log_message('user', transcript))
+        except Exception:
+            pass
+
+    def _on_listener_answer(self, answer: str):
+        try:
+            # append assistant answer into the UI
+            self.root.after(0, lambda: self.log_message('assistant', answer))
+        except Exception:
+            pass
+
+    def _toggle_listener(self):
+        # Start or stop the interview listener in a non-disruptive way
+        try:
+            if LiveInterviewListener is None:
+                self.log_message('system', 'Live listener not available (missing dependency).')
+                return
+
+            if not self._listener or not getattr(self._listener, '_running', False):
+                try:
+                    self._listener = LiveInterviewListener(self.ai, self.loop, on_transcript=self._on_listener_transcript, on_answer=self._on_listener_answer, on_status=self._on_listener_status)
+                    self._listener.start()
+                    try:
+                        self.listener_button.config(bg="#ff4444")
+                    except Exception:
+                        pass
+                    self.log_message('system', 'Interview listener started.')
+                except Exception as exc:
+                    self.log_message('system', f'Listener start failed: {exc}')
+            else:
+                try:
+                    self._listener.stop()
+                except Exception:
+                    pass
+                try:
+                    self.listener_button.config(bg="#333333")
+                except Exception:
+                    pass
+                self.log_message('system', 'Interview listener stopped.')
+        except Exception as exc:
+            try:
+                self.log_message('system', f'Listener toggle error: {exc}')
+            except Exception:
+                pass
+
+    def _on_listener_status(self, status: str):
+        # receive lifecycle and error updates from LiveInterviewListener
+        # noisy operational messages update a status label only, not the log
+        _NOISY = ('rms ', 'flushing ', 'force-flush', 'filtered:', 'stream open')
+        try:
+            if status == 'started':
+                self.root.after(0, lambda: self.log_message('system', 'Interview listener thread started'))
+            elif status == 'stopped':
+                self.root.after(0, lambda: self.log_message('system', 'Interview listener thread stopped'))
+            elif status and (status.startswith('error:') or status.startswith('transcribe_error') or status.startswith('stream_open_error')):
+                self.root.after(0, lambda s=status: self.log_message('system', f'Listener error: {s}'))
+            elif status and any(status.startswith(p) for p in _NOISY):
+                # update compact status label without touching the log scroll
+                self.root.after(0, lambda s=status: self._update_listener_status_label(s))
+            else:
+                self.root.after(0, lambda s=status: self.log_message('system', f'Listener: {s}'))
+        except Exception:
+            pass
+
+    def _update_listener_status_label(self, msg: str):
+        """Update mic status bar in-place without scrolling the log."""
+        try:
+            lbl = getattr(self, '_listener_status_lbl', None)
+            if lbl:
+                lbl.config(text=msg[:80])
+        except Exception:
+            pass
 
     def _convert_last_response_to(self, target_lang: str):
         try:
@@ -1492,8 +1601,10 @@ class OverlayApp:
             self.log.insert(tk.END, f"{prefix}{message}\n", tag)
             if role == "assistant":
                 self.log.see(start_index)
-            else:
+            elif role == "user":
+                # scroll to show new user message
                 self.log.see(tk.END)
+            # system messages do NOT force-scroll — user stays at the answer
 
         self.root.after(0, append)
 
