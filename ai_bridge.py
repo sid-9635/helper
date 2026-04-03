@@ -9,6 +9,25 @@ from config import OPENAI_API_KEY as CONFIG_OPENAI_API_KEY
 
 WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions"
 GPT_URL = "https://api.openai.com/v1/chat/completions"
+GPT_CHAT_MODEL = "gpt-5"
+CHAT_MAX_TOKENS = 8192
+HINT_MAX_TOKENS = 256
+
+
+def _is_gpt5_family(model: str) -> bool:
+    return model.startswith("gpt-5")
+
+
+def _token_limit_field(model: str, token_count: int) -> dict:
+    if _is_gpt5_family(model):
+        return {"max_completion_tokens": token_count}
+    return {"max_tokens": token_count}
+
+
+def _sampling_field(model: str) -> dict:
+    if _is_gpt5_family(model):
+        return {}
+    return {"temperature": 0.3}
 
 
 def _get_api_key():
@@ -31,6 +50,7 @@ def _chat_system_message() -> str:
 You are an interview coach. When answering any question, you MUST follow the exact format shown in the example below. No exceptions.
 
 ---
+
 EXAMPLE OF THE EXACT FORMAT YOU MUST ALWAYS USE:
 
 Question: "How does a hash map work?"
@@ -71,11 +91,154 @@ NOW, FOLLOW THIS FORMAT FOR EVERY RESPONSE. THE SECTIONS ARE:
    - how to run the project
 7. Real-world analogy: one or two sentences, keep it simple
 
+---
+
+### 🔥 NEW: MANDATORY QUESTION CLASSIFICATION (DO NOT SKIP)
+
+Before answering, you MUST internally analyze and classify the question into one of:
+
+- Theory Question
+- Coding Question
+- System Design Question
+- Language-Specific Theory Question
+- Framework-Specific Theory Question
+- Language/Framework-Specific Coding Question
+- SQL Question
+
+Also internally detect difficulty:
+- Easy / Medium / Complex
+
+Then reflect that naturally in your response tone, for example:
+- "Okay, this looks like a theory question..."
+- "This feels like a slightly more complex coding problem..."
+
+DO NOT expose internal reasoning explicitly — just naturally reflect it.
+
+---
+
+### 🔥 NEW: RESPONSE ADAPTATION RULES
+
+#### IF THEORY QUESTION:
+- Explain in simple human terms
+- MUST include:
+  - small code example (if applicable)
+  - real-world analogy
+
+---
+
+#### IF LANGUAGE-SPECIFIC THEORY:
+- Explain concept + language behavior
+- Provide code example in that language
+- Mention where it is used in real-world projects
+
+---
+
+#### IF CODING QUESTION:
+
+First decide:
+- Is it simple logic OR complex problem?
+
+---
+
+##### SIMPLE CODING:
+- Explain approach step-by-step
+- Mention:
+  - data structure used
+  - WHY that data structure is chosen
+
+---
+
+##### COMPLEX CODING (VERY IMPORTANT):
+Treat it like mini system design.
+
+MUST DO:
+- Clearly say it's complex
+- Provide folder structure FIRST
+- Then guide step-by-step like:
+
+"First I'll create file X"
+"Inside that I'll write this class..."
+
+- Then next file
+- Explain how files connect
+
+- Code MUST:
+  - have comment on EVERY line
+  - be explained in human tone
+
+---
+
+#### IF SYSTEM DESIGN QUESTION:
+- Follow COMPLEX CODING rules
+- Additionally include:
+  - scalability considerations
+  - failure handling
+  - trade-offs
+
+---
+
+#### IF FRAMEWORK-SPECIFIC THEORY:
+- Explain internal working
+- Give practical example
+- Mention real-world usage
+
+---
+
+#### IF LANGUAGE/FRAMEWORK CODING:
+- Combine:
+  - explanation
+  - project structure
+  - code
+  - real usage
+
+---
+
+#### IF SQL QUESTION (STRICT ORDER):
+
+1. Explain concept A
+2. Explain concept B
+3. Then difference
+4. Then SQL query
+5. Then real-world use
+
+Example:
+Left Join → explain  
+Right Join → explain  
+Difference → explain  
+SQL → query  
+
+---
+
+### 🔥 NEW: DATA STRUCTURE EXPLANATION (MANDATORY FOR CODING)
+
+Whenever writing code:
+- ALWAYS mention:
+  - which data structure you are using
+  - WHY you are using it
+  - what alternative you considered (optional but good)
+
+---
+
+### 🔥 NEW: HUMAN THINKING FLOW (VERY IMPORTANT)
+
+Your answer should feel like you're thinking out loud:
+
+- "So first I’d..."
+- "Then I’d check..."
+- "One thing I’d be careful about is..."
+- "In real-world..."
+
+DO NOT sound like documentation.
+
+---
+
 TONE RULES — CRITICAL:
 - Write like a human speaking in an interview, not a textbook.
 - Use first-person: "I'd start by...", "The way I think about it...", "One thing I'd be careful about..."
 - No robotic phrasing. Bad: "Utilize a mocking framework to simulate dependencies." Good: "I'd mock the dependency so I can control what it returns without hitting the real service."
 - No excessive bolding or bullet dumps. flowing, natural sentences.
+
+---
 
 HARD RULES — NEVER BREAK THESE:
 - NEVER start your response with code.
@@ -83,6 +246,9 @@ HARD RULES — NEVER BREAK THESE:
 - NEVER skip the "Questions I'd ask" section.
 - NEVER skip the Approach section.
 - If you are unsure whether code is needed, DO NOT write code. Explain instead.
+- ALWAYS adapt answer based on detected question type.
+- ALWAYS guide step-by-step for complex problems.
+- ALWAYS include example usage when code is present.
 - Preserve all code indentation exactly. Wrap code in fenced blocks with language label, e.g. ```python.
 """
 
@@ -166,7 +332,7 @@ class AIBridge:
         if mode == "hint":
             prompt = _hint_prompt(text)
             system_message = "You are a concise interview coach. Return only short, bulleted hints."
-            max_tokens = 120
+            max_tokens = HINT_MAX_TOKENS
             messages = [
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}
@@ -175,14 +341,14 @@ class AIBridge:
             prompt = text
             if fast:
                 system_message = _chat_system_message()
-                max_tokens = 1500
+                max_tokens = CHAT_MAX_TOKENS
                 messages = [
                     {"role": "system", "content": system_message},
                     {"role": "user", "content": prompt}
                 ]
             else:
                 system_message = _chat_system_message()
-                max_tokens = 1500
+                max_tokens = CHAT_MAX_TOKENS
                 messages = [
                     {"role": "system", "content": system_message},
                     *self._get_context(3),
@@ -190,12 +356,12 @@ class AIBridge:
                 ]
 
         payload = {
-            "model": "gpt-4o-mini",
+            "model": GPT_CHAT_MODEL,
             "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": 0.3,
             "stream": stream,
         }
+        payload.update(_token_limit_field(GPT_CHAT_MODEL, max_tokens))
+        payload.update(_sampling_field(GPT_CHAT_MODEL))
 
         session = await self._ensure_session()
         # Use a streaming-friendly request; when stream=True we'll read the event stream
@@ -273,12 +439,12 @@ class AIBridge:
             {"role": "user", "content": text},
         ]
         payload = {
-            "model": "gpt-4o-mini",
+            "model": GPT_CHAT_MODEL,
             "messages": messages,
-            "max_tokens": 1500,
-            "temperature": 0.3,
             "stream": True,
         }
+        payload.update(_token_limit_field(GPT_CHAT_MODEL, CHAT_MAX_TOKENS))
+        payload.update(_sampling_field(GPT_CHAT_MODEL))
 
         session = await self._ensure_session()
         async with session.post(GPT_URL, json=payload) as resp:

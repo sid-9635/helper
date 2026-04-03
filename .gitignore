@@ -5,3 +5,6 @@ chat.db
 assistant_data.db
 models/
 tools/
+test.py
+.log
+base_prompt.txt

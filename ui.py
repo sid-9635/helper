@@ -286,7 +286,7 @@ class OverlayApp:
 
     def _append_assistant_chunk(self, text: str):
         def append():
-            # Clear "Thinking..." placeholder on the very first real token
+            # Clear any pending placeholder state on the first real token
             try:
                 pos = getattr(self, '_thinking_placeholder_start', None)
                 if pos is not None:
@@ -324,9 +324,6 @@ class OverlayApp:
         # reset user-scrolled flag so auto-anchoring can occur initially
         self._user_scrolled = False
         self.log.insert(tk.END, "Assistant: ", "assistant")
-        # Insert "Thinking..." placeholder; cleared on first real token
-        self._thinking_placeholder_start = self.log.index(tk.END)
-        self.log.insert(tk.END, "Thinking...", "thinking")
         # ensure anchor is visible
         try:
             self.log.see(self._assistant_stream_anchor)
@@ -426,49 +423,9 @@ class OverlayApp:
         except Exception:
             pass
 
-        # If the assistant did not include example usages or an interviewer-style explanation,
-        # request them once and append to the response.
+        # Keep responses concise; do not auto-request extra examples or explanations.
         try:
-            def _has_examples_or_expl(s: str) -> bool:
-                try:
-                    if not s or not s.strip():
-                        return False
-                    low = s.lower()
-                    if 'example' in low or 'usage' in low or 'usage:' in low:
-                        return True
-                    # look for 'Example' code block markers followed by text
-                    if 'example usage' in low or 'example usage:' in low:
-                        return True
-                    return False
-                except Exception:
-                    return False
-
-            if not getattr(self, '_examples_requested', False) and not _has_examples_or_expl(last):
-                def _request_examples():
-                    try:
-                        self._examples_requested = True
-                        lang = getattr(self, 'lang_var', None).get() if getattr(self, 'lang_var', None) else 'Python'
-                        req = (
-                            f"Please append at least two short example usages (with concrete values) showing how to run or call the code in the previous assistant response. Place these examples immediately after the code block and before the explanation. "
-                            f"Then add a brief interviewer-style explanation describing design choices, complexity, and edge-cases. Respond in {lang}.\n\nPrevious assistant output:\n" + last
-                        )
-                        future = asyncio.run_coroutine_threadsafe(
-                            self.ai.ask_gpt(req, mode='chat', stream=False, fast=True),
-                            self.loop,
-                        )
-                        try:
-                            extra = future.result(timeout=60) or ''
-                            if extra:
-                                self.root.after(0, lambda: self.log_message('assistant', extra))
-                                try:
-                                    self._last_assistant = (self._last_assistant or '') + '\n' + extra
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                threading.Thread(target=_request_examples, daemon=True).start()
+            pass
         except Exception:
             pass
 
@@ -543,13 +500,6 @@ class OverlayApp:
                 # record the exact position right after it without a scheduling gap.
                 self.log.insert(tk.END, f"You: {transcript}\n", "user")
                 self.log.see(tk.END)
-                # Record position NOW — after the user line — so delete never touches it
-                self._listener_thinking_start = self.log.index(tk.END)
-                self.log.insert(tk.END, "Assistant: Thinking...\n", "thinking")
-                try:
-                    self.log.see(self._listener_thinking_start)
-                except Exception:
-                    pass
             self.root.after(0, _show)
         except Exception:
             pass
@@ -849,9 +799,7 @@ class OverlayApp:
             self.root.after(0, lambda: self.status_label.config(text="Answering now...", fg="#a6e22e"))
             self.root.after(0, self._begin_assistant_stream)
 
-            # append default instruction to include example usage when code is returned
-            prompt_with_instr = prompt + ("\n\nAdditionally: if you include code in your response, append at least two short example usages showing how to call or run the code with concrete example values. Place these examples immediately after the code block and before the explanation. "
-                                           "Then add a brief interviewer-style explanation describing the design choices, complexity, and edge-cases handled.")
+            prompt_with_instr = prompt + ("\n\nAdditionally: if you include code, keep it concise, runnable, and focused on the requested solution. Do not add extra examples or long explanations unless asked.")
             future = asyncio.run_coroutine_threadsafe(
                 self.ai.ask_gpt(prompt_with_instr, mode="chat", stream=True, on_delta=self._append_assistant_chunk),
                 self.loop,
@@ -1085,10 +1033,10 @@ class OverlayApp:
             self._pending_auto_send_id = None
             lang = getattr(self, 'lang_var', None).get() if getattr(self, 'lang_var', None) else 'Python'
             forced = (
-                f"Treat the captured text as a coding interview task. Extract any candidate problem statement or examples and produce a concise, runnable {lang} solution. "
-                "If nothing explicit exists, make a reasonable assumption about the intended problem and provide a minimal solution.\n\n"
+                f"Treat the captured text as the task to solve. Produce a concise, runnable {lang} solution that matches the captured request exactly. "
+                "Do not reuse earlier prompts or add unrelated requirements. If the text is too ambiguous, say what is missing briefly.\n\n"
                 "Captured text:\n" + text + (
-                    f"\n\nAdditionally: whenever you include code in your response, annotate each line of the code with a short, human-sounding comment explaining what that line does. Use conversational, natural language (not robotic) and the target language's single-line comment syntax (for example, '//' for Java/C-like languages or '#' for Python). Place comments inline when feasible. Respond using {lang} code blocks where applicable. Also include at least two short example usages demonstrating how to call or run the code with concrete values; place these examples immediately after the code block and before the explanation. Then provide a concise interviewer-style explanation of your choices, complexity, and edge-cases."
+                    f"\n\nAdditionally: if you include code, keep it concise, runnable, and focused on the requested solution. Respond using {lang} code blocks where applicable. Do not add long explanations unless needed."
                 )
             )
             # start streaming
@@ -1745,8 +1693,7 @@ class OverlayApp:
                 f"Always prefer {lang} for solutions. Make code runnable and minimal. Now analyze the following captured text:\n\n"
                 "Captured text:\n" + text_box.get('1.0', tk.END)
             )
-            # ensure example usage is requested when assistant provides code
-            user_prompt += "\n\nAdditionally: whenever you include code in your response, please append at least two short example usages showing how to call or run the code with concrete values; place these examples immediately after the code block and before the explanation, and then provide a brief interviewer-style explanation describing why you chose this approach and what edge-cases/complexity you considered."
+            user_prompt += "\n\nAdditionally: if you include code, keep it concise, runnable, and focused on the requested solution. Do not add extra examples or long explanations unless asked."
             preview.destroy()
             self.log_message('system', 'Captured region; sending to AI...')
             threading.Thread(target=self._capture_ask_thread, args=(user_prompt,), daemon=True).start()
@@ -1918,10 +1865,10 @@ class OverlayApp:
 
         # Build forced prompt for coding-interview interpretation (concise, runnable Python)
         forced = (
-            "Treat the captured text as a coding interview task. Extract any candidate problem statement or examples and produce a concise, runnable Python solution. "
-            "If nothing explicit exists, make a reasonable assumption about the intended problem and provide a minimal solution.\n\n"
+            "Treat the captured text as the task to solve. Produce a concise, runnable Python solution that matches the captured request exactly. "
+            "Do not reuse earlier prompts or add unrelated requirements. If the text is too ambiguous, say what is missing briefly.\n\n"
             "Captured text:\n" + text + (
-                "\n\nAdditionally: whenever you include code in your response, annotate each line of the code with a short, human-sounding comment explaining what that line does. Use conversational, natural language (not robotic) and the target language's single-line comment syntax (e.g. '#' for Python). Place comments inline when feasible."
+                "\n\nAdditionally: if you include code, keep it concise, runnable, and focused on the requested solution. Do not add long explanations unless needed."
             )
         )
 
