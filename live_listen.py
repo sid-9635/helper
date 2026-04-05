@@ -15,6 +15,11 @@ from asyncio import run_coroutine_threadsafe
 from typing import Callable, Optional
 
 try:
+    from config import DEFAULT_MIC_DEVICE as CONFIG_DEFAULT_MIC_DEVICE
+except Exception:
+    CONFIG_DEFAULT_MIC_DEVICE = None
+
+try:
     import sounddevice as sd
     import numpy as np
 except ImportError:
@@ -30,6 +35,8 @@ class LiveInterviewListener:
         on_transcript: Optional[Callable[[str], None]] = None,
         on_answer: Optional[Callable[[str], None]] = None,
         on_status: Optional[Callable[[str], None]] = None,
+        preferred_device: Optional[int] = None,
+        selected_model: str = "gpt-4o",
         samplerate: int = 16000,
         channels: int = 1,
         chunk_seconds: float = 0.2,    # 200 ms blocks — fast VAD with low latency
@@ -41,6 +48,8 @@ class LiveInterviewListener:
         self.on_answer = on_answer
         self.on_answer_delta = None  # set externally for streaming output
         self.on_status = on_status
+        self.preferred_device = preferred_device
+        self.selected_model = selected_model
         self.samplerate = samplerate
         self.channels = channels
         self.chunk_seconds = max(0.1, chunk_seconds)  # floor at 100 ms
@@ -143,6 +152,86 @@ class LiveInterviewListener:
                 self.on_status(msg)
             except Exception:
                 pass
+
+    def _valid_input_device(self, device_index: Optional[int]):
+        if device_index is None:
+            return None
+        try:
+            info = sd.query_devices(int(device_index))
+        except Exception:
+            return None
+        if int(info.get("max_input_channels", 0) or 0) <= 0:
+            return None
+        return int(device_index), info
+
+    def _preferred_loopback_device(self):
+        preferred_tokens = (
+            "stereo mix",
+            "what u hear",
+            "wave out",
+            "loopback",
+            "speakers (loopback)",
+        )
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            return None
+
+        for index, info in enumerate(devices):
+            if int(info.get("max_input_channels", 0) or 0) <= 0:
+                continue
+            name = str(info.get("name", "")).lower()
+            if any(token in name for token in preferred_tokens):
+                return index, info
+        return None
+
+    def _preferred_microphone_device(self):
+        preferred_tokens = (
+            "microphone array",
+            "microphone",
+            "mic array",
+            "internal mic",
+        )
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            return None
+
+        for index, info in enumerate(devices):
+            if int(info.get("max_input_channels", 0) or 0) <= 0:
+                continue
+            name = str(info.get("name", "")).lower()
+            if any(token in name for token in preferred_tokens):
+                return index, info
+        return None
+
+    def _pick_input_device(self):
+        try:
+            default_pair = sd.default.device
+            default_input = default_pair[0] if isinstance(default_pair, (list, tuple)) else default_pair
+        except Exception:
+            default_input = None
+
+        for candidate in (
+            self.preferred_device,
+            default_input,
+            self._preferred_microphone_device(),
+            CONFIG_DEFAULT_MIC_DEVICE,
+            self._preferred_loopback_device(),
+        ):
+            if isinstance(candidate, tuple):
+                return candidate
+            resolved = self._valid_input_device(candidate)
+            if resolved is not None:
+                return resolved
+
+        try:
+            for index, info in enumerate(sd.query_devices()):
+                if int(info.get("max_input_channels", 0) or 0) > 0:
+                    return index, info
+        except Exception:
+            pass
+        return None, None
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -259,7 +348,7 @@ class LiveInterviewListener:
 
                     reply_fut = run_coroutine_threadsafe(
                         self.ai.ask_gpt(transcript, mode="chat", stream=True,
-                                        on_delta=_delta, fast=True),
+                                        on_delta=_delta, fast=False, selected_model=self.selected_model),
                         self.loop,
                     )
                     reply = reply_fut.result(timeout=30)
@@ -270,9 +359,9 @@ class LiveInterviewListener:
                         except Exception:
                             pass
                 else:
-                    # ── Non-streaming fallback ────────────────────────────────────
+                    # ── Streaming request without per-token UI callback ───────────
                     reply_fut = run_coroutine_threadsafe(
-                        self.ai.ask_gpt(transcript, mode="chat", stream=False, fast=True),
+                        self.ai.ask_gpt(transcript, mode="chat", stream=True, fast=False, selected_model=self.selected_model),
                         self.loop,
                     )
                     reply = reply_fut.result(timeout=30)
@@ -296,31 +385,9 @@ class LiveInterviewListener:
 
     def _record_loop(self):
         # ── pick a working input device ───────────────────────────────────────
-        use_device = None
         use_sr = self.samplerate
         use_ch = self.channels
-
-        try:
-            dd = sd.default.device
-            use_device = dd[0] if isinstance(dd, (list, tuple)) else dd
-        except Exception:
-            use_device = None
-
-        info = None
-        try:
-            if use_device is not None:
-                info = sd.query_devices(use_device)
-                if int(info.get("max_input_channels", 0) or 0) == 0:
-                    info = None
-        except Exception:
-            info = None
-
-        if info is None:
-            for i, d in enumerate(sd.query_devices()):
-                if int(d.get("max_input_channels", 0) or 0) > 0:
-                    use_device = i
-                    info = d
-                    break
+        use_device, info = self._pick_input_device()
 
         if info:
             use_sr = int(info.get("default_samplerate") or self.samplerate)
@@ -334,8 +401,9 @@ class LiveInterviewListener:
         HEARTBEAT      = max(1, round(5.0 / self.chunk_seconds))   # rms log every ~5 s
         Q_TIMEOUT      = self.chunk_seconds + 0.1                  # queue.get timeout
 
+        device_name = info.get("name") if info else "unknown"
         self._emit(
-            f"device_selected: {use_device}  channels={use_ch}  samplerate={use_sr}"
+            f"device_selected: {use_device} ({device_name})  channels={use_ch}  samplerate={use_sr}"
         )
 
         # ── open InputStream with callback queue ──────────────────────────────

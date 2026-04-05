@@ -44,6 +44,7 @@ class OverlayApp:
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self._start_async_loop, daemon=True).start()
         self.ai = AIBridge(self.db)
+        self.selected_model = "gpt-4o"
         # pre-warm the AI HTTP session to reduce first-request latency
         try:
             asyncio.run_coroutine_threadsafe(self.ai._ensure_session(), self.loop)
@@ -175,6 +176,29 @@ class OverlayApp:
         except Exception:
             # fallback: no dropdown on environments with issues
             pass
+
+        model_frame = tk.Frame(prompt_frame, bg="#111111")
+        model_frame.pack(side="left", padx=(0, 6))
+
+        self.gpt4o_button = tk.Button(
+            model_frame,
+            text="GPT-4o",
+            command=lambda: self._set_selected_model("gpt-4o"),
+            width=8,
+            relief="flat",
+        )
+        self.gpt4o_button.pack(side="left", padx=(0, 4))
+
+        self.gpt5_button = tk.Button(
+            model_frame,
+            text="GPT-5",
+            command=lambda: self._set_selected_model("gpt-5"),
+            width=8,
+            relief="flat",
+        )
+        self.gpt5_button.pack(side="left")
+
+        self._refresh_model_buttons()
         
 
         self.send_button = tk.Button(
@@ -255,6 +279,28 @@ class OverlayApp:
         self._last_ocr = None
         self._capture_cancelled = False
 
+    def _set_selected_model(self, model_name: str):
+        self.selected_model = model_name
+        self._refresh_model_buttons()
+
+    def _refresh_model_buttons(self):
+        active_bg = "#44b94e"
+        active_fg = "white"
+        inactive_bg = "#333333"
+        inactive_fg = "#dddddd"
+
+        if hasattr(self, "gpt4o_button"):
+            active = self.selected_model == "gpt-4o"
+            self.gpt4o_button.config(bg=active_bg if active else inactive_bg, fg=active_fg if active else inactive_fg)
+
+        if hasattr(self, "gpt5_button"):
+            active = self.selected_model == "gpt-5"
+            self.gpt5_button.config(bg=active_bg if active else inactive_bg, fg=active_fg if active else inactive_fg)
+
+    def _has_active_request(self) -> bool:
+        future = getattr(self, '_current_ai_future', None)
+        return bool(future and not future.done())
+
     def _on_move(self, event):
         x = self.root.winfo_x() + event.x - self.drag_offset[0]
         y = self.root.winfo_y() + event.y - self.drag_offset[1]
@@ -286,47 +332,31 @@ class OverlayApp:
 
     def _append_assistant_chunk(self, text: str):
         def append():
-            # Clear any pending placeholder state on the first real token
             try:
                 pos = getattr(self, '_thinking_placeholder_start', None)
                 if pos is not None:
                     self.log.delete(pos, tk.END)
                     del self._thinking_placeholder_start
-            except Exception:
-                pass
-            self.log.insert(tk.END, text, "assistant")
-            # accumulate into current assistant buffer for possible translation
-            try:
                 if not hasattr(self, '_assistant_buffer'):
                     self._assistant_buffer = ''
                 self._assistant_buffer += text
-            except Exception:
-                pass
-            # keep view anchored at the start of the assistant stream if set
-            try:
-                anchor = getattr(self, "_assistant_stream_anchor", None)
-                user_scrolled = getattr(self, "_user_scrolled", False)
-                # Only auto-anchor while streaming if the user hasn't manually scrolled
-                if anchor and not user_scrolled:
-                    self.log.see(anchor)
+                self.log.insert(tk.END, text, "assistant")
+                if not getattr(self, '_user_scrolled', False):
+                    self.log.see(tk.END)
             except Exception:
                 pass
         self.root.after(0, append)
 
     def _begin_assistant_stream(self):
-        # record an anchor index at the start of the assistant response
         self._assistant_stream_anchor = self.log.index(tk.END)
-        # reset buffer where streaming chunks will be collected
         try:
             self._assistant_buffer = ''
         except Exception:
             pass
-        # reset user-scrolled flag so auto-anchoring can occur initially
         self._user_scrolled = False
         self.log.insert(tk.END, "Assistant: ", "assistant")
-        # ensure anchor is visible
         try:
-            self.log.see(self._assistant_stream_anchor)
+            self.log.see(tk.END)
         except Exception:
             pass
 
@@ -360,7 +390,6 @@ class OverlayApp:
             pass
 
     def _finish_assistant_stream(self):
-        # Clear "Thinking..." placeholder if no tokens ever arrived (error / empty response)
         try:
             pos = getattr(self, '_thinking_placeholder_start', None)
             if pos is not None:
@@ -368,78 +397,34 @@ class OverlayApp:
                 del self._thinking_placeholder_start
         except Exception:
             pass
-        self.log.insert(tk.END, "\n", "assistant")
-        # commit the last assistant buffer so it can be converted later
         try:
-            self._last_assistant = getattr(self, '_assistant_buffer', '')
+            content = getattr(self, '_assistant_buffer', '')
+            self._last_assistant = content
+
+            if content:
+                self.log.insert(tk.END, "\n", "assistant")
+                if not getattr(self, '_user_scrolled', False):
+                    self.log.see(tk.END)
+            else:
+                anchor = getattr(self, '_assistant_stream_anchor', None)
+                if anchor:
+                    self.log.delete(anchor, tk.END)
+
             if hasattr(self, '_assistant_buffer'):
                 delattr(self, '_assistant_buffer')
+            if hasattr(self, '_assistant_stream_anchor'):
+                delattr(self, '_assistant_stream_anchor')
         except Exception:
             self._last_assistant = None
-        # after finishing, run a quick completeness check and request continuation if truncated
-        try:
-            last = getattr(self, '_last_assistant', '') or ''
-            def _incomplete(s: str) -> bool:
-                try:
-                    if not s or not s.strip():
-                        return False
-                    # unbalanced code fences
-                    if s.count('```') % 2 != 0:
-                        return True
-                    # ends with alphanumeric (likely cut mid-sentence)
-                    st = s.strip()
-                    if st and st[-1].isalnum():
-                        return True
-                    return False
-                except Exception:
-                    return False
 
-            if _incomplete(last):
-                # ask for continuation non-streaming to get the remainder reliably
-                def _complete():
-                    try:
-                        lang = getattr(self, 'lang_var', None).get() if getattr(self, 'lang_var', None) else 'Python'
-                        cont_prompt = (
-                            f"Continue and finish the previous assistant response. Ensure any open code blocks are completed and provide the remaining code and any missing explanation. Respond in {lang}.\n\nPrevious assistant output:\n" + last
-                        )
-                        future = asyncio.run_coroutine_threadsafe(
-                            self.ai.ask_gpt(cont_prompt, mode='chat', stream=False, fast=True),
-                            self.loop,
-                        )
-                        try:
-                            extra = future.result(timeout=60) or ''
-                            if extra:
-                                self.root.after(0, lambda: self.log_message('assistant', extra))
-                                # append to last_assistant so conversions include full text
-                                try:
-                                    self._last_assistant = (self._last_assistant or '') + '\n' + extra
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                threading.Thread(target=_complete, daemon=True).start()
-        except Exception:
-            pass
-
-        # Keep responses concise; do not auto-request extra examples or explanations.
+    def _hydrate_stream_buffer_from_result(self, response: str | None):
+        if not response:
+            return
         try:
-            pass
-        except Exception:
-            pass
-
-        try:
-            # if the user didn't scroll, show full response at end; otherwise respect user's position
-            user_scrolled = getattr(self, "_user_scrolled", False)
-            if not user_scrolled:
-                try:
-                    self.log.see(tk.END)
-                except Exception:
-                    pass
-            # clear the anchor so future output scrolls normally
-            if hasattr(self, "_assistant_stream_anchor"):
-                delattr(self, "_assistant_stream_anchor")
+            existing = getattr(self, '_assistant_buffer', '')
+            if existing and existing.strip():
+                return
+            self._assistant_buffer = response
         except Exception:
             pass
 
@@ -508,10 +493,12 @@ class OverlayApp:
         """Called for each streamed token from the listener GPT call."""
         def _append():
             try:
+                if not hasattr(self, '_listener_buffer'):
+                    self._listener_buffer = ''
+                self._listener_buffer += token
                 self.log.insert(tk.END, token, "assistant")
-                anchor = getattr(self, '_listener_stream_anchor', None)
-                if anchor and not getattr(self, '_user_scrolled', False):
-                    self.log.see(anchor)
+                if not getattr(self, '_user_scrolled', False):
+                    self.log.see(tk.END)
             except Exception:
                 pass
         self.root.after(0, _append)
@@ -528,19 +515,21 @@ class OverlayApp:
             except Exception:
                 pass
 
-            if hasattr(self, '_listener_stream_anchor'):
-                # Streaming was active — tokens already appended, just close out
-                try:
-                    self.log.insert(tk.END, "\n", "assistant")
-                    self._last_assistant = full_reply
+            try:
+                reply = full_reply or getattr(self, '_listener_buffer', '') or ''
+                if reply:
+                    self._last_assistant = reply
+                    self.log.insert(tk.END, '\n', 'assistant')
                     if not getattr(self, '_user_scrolled', False):
                         self.log.see(tk.END)
+                elif hasattr(self, '_listener_stream_anchor'):
+                    self.log.delete(self._listener_stream_anchor, tk.END)
+                if hasattr(self, '_listener_stream_anchor'):
                     del self._listener_stream_anchor
-                except Exception:
-                    pass
-            else:
-                # Non-streaming fallback or streaming that never started — show full answer
-                self.log_message('assistant', full_reply)
+                if hasattr(self, '_listener_buffer'):
+                    del self._listener_buffer
+            except Exception:
+                pass
         self.root.after(0, _finish)
 
     def _toggle_listener(self):
@@ -557,6 +546,8 @@ class OverlayApp:
                         on_transcript=self._on_listener_transcript,
                         on_answer=self._on_listener_answer,
                         on_status=self._on_listener_status,
+                        preferred_device=getattr(self, '_selected_device', None),
+                        selected_model=self.selected_model,
                     )
                     self._listener.on_answer_delta = self._on_listener_answer_delta
                     self._listener.start()
@@ -593,7 +584,6 @@ class OverlayApp:
             elif status == 'stopped':
                 self.root.after(0, lambda: self.log_message('system', 'Interview listener thread stopped'))
             elif status == 'answer:streaming_start':
-                # First token arrived — swap Thinking... for the real stream
                 def _begin_stream():
                     try:
                         pos = getattr(self, '_listener_thinking_start', None)
@@ -603,11 +593,10 @@ class OverlayApp:
                     except Exception:
                         pass
                     self._listener_stream_anchor = self.log.index(tk.END)
-                    self.log.insert(tk.END, "Assistant: ", "assistant")
-                    try:
-                        self.log.see(self._listener_stream_anchor)
-                    except Exception:
-                        pass
+                    self._listener_buffer = ''
+                    self.log.insert(tk.END, 'Assistant: ', 'assistant')
+                    if not getattr(self, '_user_scrolled', False):
+                        self.log.see(tk.END)
                 self.root.after(0, _begin_stream)
             elif status == 'answer:streaming_end':
                 pass  # handled in _on_listener_answer
@@ -648,6 +637,9 @@ class OverlayApp:
             text = getattr(self, '_last_assistant', '')
             if not text or not text.strip():
                 return
+            if self._has_active_request():
+                self.root.after(0, lambda: self.log_message('system', 'A request is already running.'))
+                return
             # build a conversion prompt that asks for language translation and preserving/adding human comments
             conv = (
                 f"Convert the following code and explanation into {target_lang}. Preserve the behavior exactly. "
@@ -660,9 +652,10 @@ class OverlayApp:
             conv += ("\n\nAdditionally: when you output code, include at least two short example usages showing how to call or run the converted code with concrete example values. Place these examples immediately after the code block and before the explanation. "
                      "After the examples, provide a concise explanation written for an interviewer: describe why you chose this approach, trade-offs, complexity, and any edge-cases handled.")
             # stream the converted result into the UI
+            selected_model = self.selected_model
             self.root.after(0, self._begin_assistant_stream)
             future = asyncio.run_coroutine_threadsafe(
-                self.ai.ask_gpt(conv, mode="chat", stream=True, on_delta=self._append_assistant_chunk, fast=True),
+                self.ai.ask_gpt(conv, mode="chat", stream=True, on_delta=self._append_assistant_chunk, selected_model=selected_model, include_context=False),
                 self.loop,
             )
             self._current_ai_future = future
@@ -787,28 +780,31 @@ class OverlayApp:
         prompt = self.prompt_entry.get().strip()
         if not prompt:
             return
+        if self._has_active_request():
+            self.log_message("system", "A request is already running.")
+            return
 
         self.prompt_entry.delete(0, tk.END)
         self.log_message("user", prompt)
         self.send_button.config(state="disabled")
 
-        threading.Thread(target=self._send_prompt_thread, args=(prompt,), daemon=True).start()
+        threading.Thread(target=self._send_prompt_thread, args=(prompt, self.selected_model), daemon=True).start()
 
-    def _send_prompt_thread(self, prompt: str):
+    def _send_prompt_thread(self, prompt: str, selected_model: str):
         try:
             self.root.after(0, lambda: self.status_label.config(text="Answering now...", fg="#a6e22e"))
             self.root.after(0, self._begin_assistant_stream)
 
-            prompt_with_instr = prompt + ("\n\nAdditionally: if you include code, keep it concise, runnable, and focused on the requested solution. Do not add extra examples or long explanations unless asked.")
             future = asyncio.run_coroutine_threadsafe(
-                self.ai.ask_gpt(prompt_with_instr, mode="chat", stream=True, on_delta=self._append_assistant_chunk),
+                self.ai.ask_gpt(prompt, mode="chat", stream=True, on_delta=self._append_assistant_chunk, selected_model=selected_model, include_context=True),
                 self.loop,
             )
             # track current AI future so it can be cancelled if needed
             self._current_ai_future = future
             try:
                 # extended timeout to avoid truncated/early termination of streaming responses
-                future.result(timeout=300)
+                response = future.result(timeout=300)
+                self.root.after(0, lambda response=response: self._hydrate_stream_buffer_from_result(response))
             except Exception as exc:
                 self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Chat error: {type(exc).__name__}: {exc}'))
             self.root.after(0, self._finish_assistant_stream)
@@ -860,6 +856,69 @@ class OverlayApp:
 
         return False
 
+    def _get_overlay_hwnd(self):
+        if platform.system() != 'Windows':
+            return None
+        try:
+            hwnd = self.root.winfo_id()
+            return ctypes.windll.user32.GetAncestor(hwnd, 2)
+        except Exception:
+            return None
+
+    def _get_foreground_window_bbox(self):
+        if platform.system() != 'Windows':
+            return None
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return None
+            overlay_hwnd = self._get_overlay_hwnd()
+            if overlay_hwnd and hwnd == overlay_hwnd:
+                return None
+
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return None
+
+            left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
+            if right - left < 120 or bottom - top < 120:
+                return None
+            return (left, top, right, bottom)
+        except Exception:
+            return None
+
+    def _grab_preferred_capture_image(self, image_grab_module):
+        bbox = self._get_foreground_window_bbox()
+        if bbox:
+            try:
+                return image_grab_module.grab(bbox=bbox), 'active-window'
+            except Exception:
+                pass
+        return image_grab_module.grab(all_screens=True), 'all-screens'
+
+    def _ocr_confidence(self, image, pytesseract) -> float:
+        try:
+            data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+        except Exception:
+            return -1.0
+
+        confidences = []
+        for raw_conf, raw_text in zip(data.get('conf', []), data.get('text', [])):
+            text = (raw_text or '').strip()
+            if not text:
+                continue
+            try:
+                conf = float(raw_conf)
+            except Exception:
+                continue
+            if conf >= 0:
+                confidences.append(conf)
+
+        if not confidences:
+            return -1.0
+        return sum(confidences) / len(confidences)
+
     def capture_screen_and_answer(self):
         """Capture the screen (image), OCR it to text, and send to the AI for an answer.
 
@@ -891,7 +950,8 @@ class OverlayApp:
                 pass
 
             try:
-                img = ImageGrab.grab(all_screens=True)
+                img, capture_mode = self._grab_preferred_capture_image(ImageGrab)
+                self.log_message('system', f'Capture mode: {capture_mode}')
             except Exception as exc:
                 self.log_message('system', f'Screenshot failed: {exc}')
                 img = None
@@ -1003,7 +1063,8 @@ class OverlayApp:
                 self.root.after_cancel(self._pending_auto_send_id)
             except Exception:
                 pass
-        self._pending_auto_send_id = self.root.after(2000, lambda: threading.Thread(target=self._auto_send_forced, args=(text,), daemon=True).start())
+        selected_model = self.selected_model
+        self._pending_auto_send_id = self.root.after(2000, lambda: threading.Thread(target=self._auto_send_forced, args=(text, selected_model), daemon=True).start())
 
     def _cancel_pending_capture(self):
         try:
@@ -1022,10 +1083,13 @@ class OverlayApp:
         except Exception:
             pass
 
-    def _auto_send_forced(self, text: str):
+    def _auto_send_forced(self, text: str, selected_model: str):
         # Runs in background thread
         try:
             if getattr(self, '_capture_cancelled', False):
+                return
+            if self._has_active_request():
+                self.root.after(0, lambda: self.log_message('system', 'A request is already running.'))
                 return
             # disable cancel button in UI
             self.root.after(0, lambda: self.cancel_send_button.config(state='disabled'))
@@ -1034,7 +1098,8 @@ class OverlayApp:
             lang = getattr(self, 'lang_var', None).get() if getattr(self, 'lang_var', None) else 'Python'
             forced = (
                 f"Treat the captured text as the task to solve. Produce a concise, runnable {lang} solution that matches the captured request exactly. "
-                "Do not reuse earlier prompts or add unrelated requirements. If the text is too ambiguous, say what is missing briefly.\n\n"
+                "Do not reuse earlier prompts or add unrelated requirements. If the text is ambiguous, state the most practical interpretation briefly and continue. "
+                "Prefer the simplest practical real-world implementation. Do not invent extra features such as thread safety, async behavior, rotation, multiple handlers, metadata fields, retries, or scalability unless the captured text asks for them.\n\n"
                 "Captured text:\n" + text + (
                     f"\n\nAdditionally: if you include code, keep it concise, runnable, and focused on the requested solution. Respond using {lang} code blocks where applicable. Do not add long explanations unless needed."
                 )
@@ -1042,13 +1107,14 @@ class OverlayApp:
             # start streaming
             self.root.after(0, self._begin_assistant_stream)
             future = asyncio.run_coroutine_threadsafe(
-                self.ai.ask_gpt(forced, mode="chat", stream=True, on_delta=self._append_assistant_chunk, fast=True),
+                self.ai.ask_gpt(forced, mode="chat", stream=True, on_delta=self._append_assistant_chunk, selected_model=selected_model, include_context=False),
                 self.loop,
             )
             self._current_ai_future = future
             try:
                 # extended timeout for capture-triggered requests
-                future.result(timeout=300)
+                response = future.result(timeout=300)
+                self.root.after(0, lambda response=response: self._hydrate_stream_buffer_from_result(response))
             except Exception as exc:
                 self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Auto-send error: {type(exc).__name__}: {exc}'))
             finally:
@@ -1063,49 +1129,21 @@ class OverlayApp:
             except Exception:
                 pass
 
-    def _capture_ask_thread(self, prompt: str):
+    def _capture_ask_thread(self, prompt: str, selected_model: str):
         try:
+            if self._has_active_request():
+                self.root.after(0, lambda: self.log_message('system', 'A request is already running.'))
+                return
             self.root.after(0, self._begin_assistant_stream)
             future = asyncio.run_coroutine_threadsafe(
-                self.ai.ask_gpt(prompt, mode="chat", stream=True, on_delta=self._append_assistant_chunk, fast=True),
+                self.ai.ask_gpt(prompt, mode="chat", stream=True, on_delta=self._append_assistant_chunk, selected_model=selected_model, include_context=False),
                 self.loop,
             )
             self._current_ai_future = future
             response = future.result(timeout=90)
+            self.root.after(0, lambda response=response: self._hydrate_stream_buffer_from_result(response))
             if not response:
                 self.root.after(0, lambda: self.log_message("assistant", "No response received."))
-            else:
-                # if assistant explicitly said NOT_FOUND, do one forced attempt to interpret anyway
-                try:
-                    first_line = response.strip().splitlines()[0] if response.strip() else ""
-                except Exception:
-                    first_line = ""
-                if first_line.startswith("NOT_FOUND"):
-                    # build a forced prompt to coerce a best-effort solution
-                    forced = (
-                        "The assistant previously reported NOT_FOUND. Now, regardless of that, treat the captured text as if it may contain a coding task. "
-                        "Extract any candidate problem statement or example and produce a concise, runnable Python solution. "
-                        "If nothing explicit exists, make a reasonable assumption about the intended problem and provide a minimal solution.\n\n"
-                        "Captured text:\n" + prompt + (
-                                "\n\nAdditionally: whenever you include code in your response, annotate each line of the code with a short, human-sounding comment explaining what that line does. Use conversational, natural language (not robotic) and the target language's single-line comment syntax (e.g. '#' for Python). Place comments inline when feasible. Also include at least two short example usages demonstrating how to run or call the code with concrete values; place these examples immediately after the code block and before the explanation. Then provide a concise interviewer-style explanation of your choices, complexity, and edge-cases."
-                        )
-                    )
-                    # append a separator so the UI stream is distinct
-                    self.root.after(0, lambda: self.log_message('system', 'Assistant reported NOT_FOUND — forcing a best-effort solution...'))
-                    future2 = asyncio.run_coroutine_threadsafe(
-                        self.ai.ask_gpt(forced, mode="chat", stream=True, on_delta=self._append_assistant_chunk, fast=True),
-                        self.loop,
-                    )
-                    self._current_ai_future = future2
-                    try:
-                        future2.result(timeout=90)
-                    except Exception:
-                        pass
-                    finally:
-                        try:
-                            delattr(self, '_current_ai_future')
-                        except Exception:
-                            pass
             self.root.after(0, self._finish_assistant_stream)
             try:
                 delattr(self, '_current_ai_future')
@@ -1422,7 +1460,7 @@ class OverlayApp:
                 self.root.after(0, lambda: self.prompt_entry.delete(0, tk.END))
                 self.root.after(0, lambda txt=final: self.prompt_entry.insert(0, txt))
                 # send automatically the full conversation transcript
-                threading.Thread(target=self._send_prompt_thread, args=(final,), daemon=True).start()
+                threading.Thread(target=self._send_prompt_thread, args=(final, self.selected_model), daemon=True).start()
         except Exception as exc:
             self.log_message('system', f'Error stopping live listen: {exc}')
 
@@ -1696,7 +1734,7 @@ class OverlayApp:
             user_prompt += "\n\nAdditionally: if you include code, keep it concise, runnable, and focused on the requested solution. Do not add extra examples or long explanations unless asked."
             preview.destroy()
             self.log_message('system', 'Captured region; sending to AI...')
-            threading.Thread(target=self._capture_ask_thread, args=(user_prompt,), daemon=True).start()
+            threading.Thread(target=self._capture_ask_thread, args=(user_prompt, self.selected_model), daemon=True).start()
 
         def do_retry():
             # cycle to next PSM and rerun OCR
@@ -1807,8 +1845,119 @@ class OverlayApp:
             return ('', psm_list[0])
         return (best[0], best[1])
 
+    def _normalize_capture_line(self, raw_line: str) -> str:
+        line = ' '.join((raw_line or '').split())
+        return line.strip(" |`~!@#$%^&*()_+-=[]{};:'\",.<>?/\\")
+
+    def _extract_capture_task_text(self, text: str) -> str:
+        """Extract the most task-like lines from noisy full-screen OCR."""
+        if not text:
+            return ""
+
+        chrome_tokens = (
+            'visual studio code', 'powershell', 'terminal', 'outline', 'timeline', 'problems',
+            'this pc', 'recycle bin', 'type here to search', 'assistant:', 'info:', 'todos',
+            'common_prompt.txt', 'gpt_4o_mini.txt', 'gpt_5.txt', 'ui.py', 'ai_bridge.py',
+            'requirements.txt', 'readme', 'windows', 'utf-8', 'crlf', 'notepad', 'postman',
+            'file edit format view help', 'ln 29, col 1', 'ln', 'col 1', 'untitled - notepad',
+        )
+        task_tokens = (
+            'implement', 'design', 'build', 'create', 'write', 'solve', 'find', 'return',
+            'given', 'array', 'string', 'linked list', 'tree', 'graph', 'sql', 'api',
+            'latency', 'optimize', 'function', 'class', 'logger', 'module', 'system',
+        )
+        priority_tokens = ('implement', 'design', 'build', 'create', 'write', 'fix', 'add', 'make')
+
+        normalized_lines = []
+        for raw_line in text.splitlines():
+            line = self._normalize_capture_line(raw_line)
+            if line:
+                normalized_lines.append(line)
+
+        priority_lines = []
+        for line in normalized_lines:
+            lower = line.lower()
+            if any(token in lower for token in chrome_tokens):
+                continue
+            if any(token in lower for token in priority_tokens) and sum(ch.isalpha() for ch in line) >= 10:
+                priority_lines.append(line)
+
+        if priority_lines:
+            return '\n'.join(priority_lines[:3])[:1600]
+
+        scored_lines = []
+        for line in normalized_lines:
+            if len(line) < 8:
+                continue
+
+            lower = line.lower()
+            if any(token in lower for token in chrome_tokens):
+                continue
+
+            alpha_count = sum(ch.isalpha() for ch in line)
+            if alpha_count < 6:
+                continue
+
+            score = 0
+            if any(token in lower for token in task_tokens):
+                score += 5
+            if '?' in line or ':' in line:
+                score += 2
+            if len(line) >= 40:
+                score += 2
+            score += min(self._code_likelihood_score(line), 8)
+
+            if score > 0:
+                scored_lines.append((score, line))
+
+        if not scored_lines:
+            fallback_lines = []
+            for line in normalized_lines:
+                lower = line.lower()
+                if any(token in lower for token in chrome_tokens):
+                    continue
+                if len(line) >= 20 and sum(ch.isalpha() for ch in line) >= 8:
+                    fallback_lines.append(line)
+                if len(fallback_lines) >= 6:
+                    break
+            return '\n'.join(fallback_lines)[:1600]
+
+        top_lines = [line for _, line in sorted(scored_lines, key=lambda item: item[0], reverse=True)[:8]]
+        seen = set()
+        ordered = []
+        for line in normalized_lines:
+            if line in top_lines and line not in seen:
+                ordered.append(line)
+                seen.add(line)
+        return '\n'.join(ordered)[:1600]
+
+    def _capture_text_is_usable(self, candidate_text: str) -> bool:
+        if not candidate_text:
+            return False
+        lower = candidate_text.lower()
+        useful_tokens = (
+            'implement', 'design', 'build', 'create', 'write', 'solve', 'find', 'return',
+            'given', 'how', 'why', 'what', 'function', 'class', 'api', 'sql', 'logger',
+            'latency', 'system', 'module', 'question', '?'
+        )
+        has_useful_token = any(token in lower for token in useful_tokens)
+        if not has_useful_token:
+            return False
+        return len(candidate_text.strip()) >= 20
+
+    def _capture_text_has_min_signal(self, text: str) -> bool:
+        if not text:
+            return False
+        alpha_count = sum(ch.isalpha() for ch in text)
+        digit_count = sum(ch.isdigit() for ch in text)
+        return len(text.strip()) >= 60 and (alpha_count + digit_count) >= 25
+
     def _process_captured_image(self, img):
         """Background processing of a captured PIL image: OCR, logging, and scheduling send."""
+        if self._has_active_request():
+            self.root.after(0, lambda: self.log_message('system', 'A request is already running.'))
+            return
+
         try:
             import pytesseract
         except Exception:
@@ -1829,28 +1978,31 @@ class OverlayApp:
                 quick = img.convert('L')
                 quick = ImageOps.autocontrast(quick)
                 try:
-                    quick = quick.resize((int(quick.width * 1.2), int(quick.height * 1.2)), Image.LANCZOS)
+                    scale = 2.0 if max(quick.width, quick.height) >= 1400 else 1.5
+                    quick = quick.resize((int(quick.width * scale), int(quick.height * scale)), Image.LANCZOS)
                 except Exception:
                     pass
                 cfg = r'--oem 1 --psm 6'
                 quick_txt = pytesseract.image_to_string(quick, config=cfg)
+                quick_conf = self._ocr_confidence(quick, pytesseract)
             except Exception:
                 quick_txt = ''
+                quick_conf = -1.0
 
             # Decide whether quick OCR is sufficient: require some alphanumeric density
             import re
             def _alnum_count(s: str) -> int:
                 return len(re.findall(r"[A-Za-z0-9]", s or ""))
 
-            if quick_txt and quick_txt.strip() and _alnum_count(quick_txt) >= 8:
+            if quick_txt and quick_txt.strip() and _alnum_count(quick_txt) >= 8 and quick_conf >= 45:
                 # quick result appears reasonably dense; accept for low latency
                 text = quick_txt
                 chosen_psm = 6
-                self.root.after(0, lambda: self.log_message('system', f'Quick OCR used psm={chosen_psm}'))
+                self.root.after(0, lambda: self.log_message('system', f'Quick OCR used psm={chosen_psm} (conf={quick_conf:.1f})'))
             else:
                 proc_imgs = self._preprocess_for_ocr(img)
                 text, chosen_psm = self._ocr_best_psm(proc_imgs, pytesseract, psm_list=[6, 3, 11, 1])
-                self.root.after(0, lambda: self.log_message('system', f'OCR used psm={chosen_psm}'))
+                self.root.after(0, lambda: self.log_message('system', f'OCR used psm={chosen_psm} after quick conf={quick_conf:.1f}'))
         except Exception as exc:
             self.root.after(0, lambda: self.log_message("system", f"OCR failed: {exc}"))
             return
@@ -1863,12 +2015,34 @@ class OverlayApp:
         self.root.after(0, lambda: self.log_message('system', 'Captured OCR text:'))
         self.root.after(0, lambda: self.log_message('system', text))
 
+        candidate_text = self._extract_capture_task_text(text)
+        if candidate_text:
+            self.root.after(0, lambda: self.log_message('system', 'Focused task text:'))
+            self.root.after(0, lambda: self.log_message('system', candidate_text))
+
+        using_fallback_context = False
+        if not self._capture_text_is_usable(candidate_text):
+            if not self._capture_text_has_min_signal(text):
+                self.root.after(0, lambda: self.log_message('assistant', 'SCREEN_CAPTURE_TOO_NOISY: Use region capture around the question or editor area only.'))
+                return
+            using_fallback_context = True
+            candidate_text = text[:1200]
+            self.root.after(0, lambda: self.log_message('system', 'Full-screen OCR is noisy; attempting a best-effort answer from raw capture text.'))
+
+        lang = getattr(self, 'lang_var', None).get() if getattr(self, 'lang_var', None) else 'Python'
+        raw_excerpt = text[:1800]
+
         # Build forced prompt for coding-interview interpretation (concise, runnable Python)
         forced = (
-            "Treat the captured text as the task to solve. Produce a concise, runnable Python solution that matches the captured request exactly. "
-            "Do not reuse earlier prompts or add unrelated requirements. If the text is too ambiguous, say what is missing briefly.\n\n"
-            "Captured text:\n" + text + (
-                "\n\nAdditionally: if you include code, keep it concise, runnable, and focused on the requested solution. Do not add long explanations unless needed."
+            "The OCR below comes from a noisy full-screen capture and may include editor tabs, file trees, terminal text, previous assistant output, timestamps, and unrelated desktop text. "
+            "Ignore that noise and focus on the most likely user question or task. Use the focused task text first, then the raw OCR only as backup context. "
+            f"If a clear task is present, answer it with a concise, runnable {lang} solution. "
+            "If the task is vague, choose the simplest practical real-world interpretation first. Do not invent extra features such as thread safety, async behavior, rotation, multiple handlers, metadata fields, retries, or scalability unless the captured text asks for them. "
+            "If there still is not enough signal, reply exactly with: SCREEN_CAPTURE_TOO_NOISY: Use region capture around the question.\n\n"
+            f"Fallback mode: {'yes' if using_fallback_context else 'no'}\n\n"
+            "Focused task text:\n" + candidate_text + "\n\n"
+            "Raw OCR excerpt:\n" + raw_excerpt + (
+                f"\n\nAdditionally: if you include code, keep it concise, runnable, and focused on the requested solution. Respond using {lang} code blocks where applicable. Do not add long explanations unless needed."
             )
         )
 
@@ -1883,17 +2057,24 @@ class OverlayApp:
             pass
 
         try:
+            selected_model = self.selected_model
             future = asyncio.run_coroutine_threadsafe(
-                self.ai.ask_gpt(forced, mode="chat", stream=True, on_delta=self._append_assistant_chunk, fast=True),
+                self.ai.ask_gpt(forced, mode="chat", stream=True, on_delta=self._append_assistant_chunk, selected_model=selected_model, include_context=False),
                 self.loop,
             )
+            self._current_ai_future = future
             try:
-                future.result(timeout=120)
+                response = future.result(timeout=120)
+                self.root.after(0, lambda response=response: self._hydrate_stream_buffer_from_result(response))
             except Exception as exc:
                 self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Auto-send error: {type(exc).__name__}: {exc}'))
         except Exception as exc:
             self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Auto-send failed: {exc}'))
         finally:
+            try:
+                delattr(self, '_current_ai_future')
+            except Exception:
+                pass
             try:
                 self.root.after(0, self._finish_assistant_stream)
             except Exception:

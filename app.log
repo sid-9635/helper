@@ -1,3 +1,11 @@
 2026-04-03 10:23:26,359 - INFO - This is an info message.
 2026-04-03 10:23:26,360 - WARNING - This is a warning message.
 2026-04-03 10:23:26,360 - ERROR - This is an error message.
+2026-04-03 16:34:42 [DEBUG] app: Starting service on port 8080
+2026-04-03 16:34:42 [INFO] app: User alice logged in
+2026-04-03 16:34:42 [WARN] app: Cache miss rate at 42%
+2026-04-03 16:34:42 [ERROR] app: Failed to save order: ORDER-123
+2026-04-03 16:44:17 [DEBUG] app: Starting service on port 8080
+2026-04-03 16:44:17 [INFO] app: User alice logged in
+2026-04-03 16:44:17 [WARN] app: Cache miss rate at 42%
+2026-04-03 16:44:17 [ERROR] app: Failed to save order: ORDER-123

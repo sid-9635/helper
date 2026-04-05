@@ -9,9 +9,27 @@ from config import OPENAI_API_KEY as CONFIG_OPENAI_API_KEY
 
 WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions"
 GPT_URL = "https://api.openai.com/v1/chat/completions"
-GPT_CHAT_MODEL = "gpt-5"
-CHAT_MAX_TOKENS = 8192
+PROMPTS_DIR = Path(__file__).with_name("prompts")
+COMMON_PROMPT_PATH = PROMPTS_DIR / "common_prompt.txt"
+GPT4O_PROMPT_PATH = PROMPTS_DIR / "gpt_4o.txt"
+GPT4O_MINI_PROMPT_PATH = PROMPTS_DIR / "gpt_4o_mini.txt"
+GPT5_PROMPT_PATH = PROMPTS_DIR / "gpt_5.txt"
+GPT4O_MODEL = "gpt-4o"
+GPT5_MODEL = "gpt-5"
+GPT_HINT_MODEL = "gpt-4o-mini"
+GPT4O_MAX_TOKENS = 5324
+GPT5_MAX_TOKENS = 5200
+GPT5_FAST_MAX_TOKENS = 3600
 HINT_MAX_TOKENS = 256
+MAX_USER_INPUT_CHARS = 12000
+CHAT_STREAMING_ENABLED = True
+
+
+DEFAULT_COMMON_PROMPT = "You are an interview coach. Answer clearly, directly, and naturally."
+DEFAULT_GPT4O_PROMPT = "Keep the response concise, clean, and practical."
+DEFAULT_GPT4O_MINI_PROMPT = "You are a concise interview coach. Return only short, bulleted hints."
+DEFAULT_GPT5_PROMPT = "Give a more complete and precise answer while staying structured and readable."
+BASE_SYSTEM_MESSAGE = "You are a helpful interview coach. Follow the provided instructions exactly."
 
 
 def _is_gpt5_family(model: str) -> bool:
@@ -45,216 +63,63 @@ def _hint_prompt(transcript: str) -> str:
     )
 
 
-def _chat_system_message() -> str:
-    return """\
-You are an interview coach. When answering any question, you MUST follow the exact format shown in the example below. No exceptions.
+def _read_prompt_file(path: Path, fallback: str) -> str:
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+        if content:
+            return content
+    except OSError:
+        pass
+    return fallback
 
----
 
-EXAMPLE OF THE EXACT FORMAT YOU MUST ALWAYS USE:
+def _common_prompt() -> str:
+    return _read_prompt_file(COMMON_PROMPT_PATH, DEFAULT_COMMON_PROMPT)
 
-Question: "How does a hash map work?"
 
-**Question Type:** Theory
+def _model_prompt(selected_model: str) -> str:
+    if selected_model == GPT5_MODEL:
+        return _read_prompt_file(GPT5_PROMPT_PATH, DEFAULT_GPT5_PROMPT)
+    if selected_model == GPT_HINT_MODEL:
+        return _read_prompt_file(GPT4O_MINI_PROMPT_PATH, DEFAULT_GPT4O_MINI_PROMPT)
+    return _read_prompt_file(GPT4O_PROMPT_PATH, DEFAULT_GPT4O_PROMPT)
 
-**Concept:**
-So the way I think about a hash map is — it's basically a structure that lets you store and retrieve data in O(1) time. The key idea is that instead of searching through everything, you use a hash function to convert a key into an index, and then store the value at that index in an array. The tricky part is handling collisions — when two keys hash to the same index.
 
-**Questions I'd ask the interviewer:**
-- Are we building this from scratch or using an existing implementation?
-- Do we care more about memory efficiency or lookup speed?
-- What kind of keys are we dealing with — strings, integers, objects?
+def _instruction_messages(selected_model: str) -> list[dict[str, str]]:
+    messages = []
+    common_prompt = _common_prompt()
+    model_prompt = _model_prompt(selected_model)
 
-**Approach:**
-I'd start by explaining the internal array and the hash function. Then I'd talk about collision resolution — the two main strategies are chaining (linked list at each bucket) and open addressing (probe for the next empty slot). I'd mention that a good hash function minimizes collisions, and that load factor matters — once it hits around 0.75, most implementations resize.
+    if common_prompt:
+        messages.append({"role": "system", "content": common_prompt})
+    if model_prompt and model_prompt != common_prompt:
+        messages.append({"role": "system", "content": model_prompt})
 
-[Code would go here ONLY if this was a Coding question — it is not, so I skip it]
+    return messages
 
-**Real-world analogy:**
-Think of it like a library with a cataloguing system. Instead of scanning every shelf, the catalogue tells you exactly which shelf and row to go to. That's your hash function — it maps the book title directly to a location.
 
----
+def _resolve_model(selected_model: str) -> str:
+    if selected_model == GPT5_MODEL:
+        return GPT5_MODEL
+    return GPT4O_MODEL
 
-NOW, FOLLOW THIS FORMAT FOR EVERY RESPONSE. THE SECTIONS ARE:
-1. Question Type: (Theory / Coding / System Design / Testing / Mixed)
-2. Concept: conversational explanation, NO code yet
-3. Questions I'd ask the interviewer: 2-3 smart clarifying questions
-4. Approach: strategy and thinking, still NO code unless it is a Coding question
-5. Code: (ONLY if Coding or explicit implementation is asked)
-   - every line must have a comment
-   - show a usage example after the code
-   - after code: Time Complexity O(...) with one sentence why, Space Complexity O(...) with one sentence why
-6. System Design extras (ONLY if question is about designing a system or module):
-   - folder/file structure first
-   - walk through each file
-   - explain how files connect
-   - how to run the project
-7. Real-world analogy: one or two sentences, keep it simple
 
----
+def _resolve_token_limit(model: str) -> int:
+    if model == GPT5_MODEL:
+        return GPT5_MAX_TOKENS
+    return GPT4O_MAX_TOKENS
 
-### 🔥 NEW: MANDATORY QUESTION CLASSIFICATION (DO NOT SKIP)
 
-Before answering, you MUST internally analyze and classify the question into one of:
-
-- Theory Question
-- Coding Question
-- System Design Question
-- Language-Specific Theory Question
-- Framework-Specific Theory Question
-- Language/Framework-Specific Coding Question
-- SQL Question
-
-Also internally detect difficulty:
-- Easy / Medium / Complex
-
-Then reflect that naturally in your response tone, for example:
-- "Okay, this looks like a theory question..."
-- "This feels like a slightly more complex coding problem..."
-
-DO NOT expose internal reasoning explicitly — just naturally reflect it.
-
----
-
-### 🔥 NEW: RESPONSE ADAPTATION RULES
-
-#### IF THEORY QUESTION:
-- Explain in simple human terms
-- MUST include:
-  - small code example (if applicable)
-  - real-world analogy
-
----
-
-#### IF LANGUAGE-SPECIFIC THEORY:
-- Explain concept + language behavior
-- Provide code example in that language
-- Mention where it is used in real-world projects
-
----
-
-#### IF CODING QUESTION:
-
-First decide:
-- Is it simple logic OR complex problem?
-
----
-
-##### SIMPLE CODING:
-- Explain approach step-by-step
-- Mention:
-  - data structure used
-  - WHY that data structure is chosen
-
----
-
-##### COMPLEX CODING (VERY IMPORTANT):
-Treat it like mini system design.
-
-MUST DO:
-- Clearly say it's complex
-- Provide folder structure FIRST
-- Then guide step-by-step like:
-
-"First I'll create file X"
-"Inside that I'll write this class..."
-
-- Then next file
-- Explain how files connect
-
-- Code MUST:
-  - have comment on EVERY line
-  - be explained in human tone
-
----
-
-#### IF SYSTEM DESIGN QUESTION:
-- Follow COMPLEX CODING rules
-- Additionally include:
-  - scalability considerations
-  - failure handling
-  - trade-offs
-
----
-
-#### IF FRAMEWORK-SPECIFIC THEORY:
-- Explain internal working
-- Give practical example
-- Mention real-world usage
-
----
-
-#### IF LANGUAGE/FRAMEWORK CODING:
-- Combine:
-  - explanation
-  - project structure
-  - code
-  - real usage
-
----
-
-#### IF SQL QUESTION (STRICT ORDER):
-
-1. Explain concept A
-2. Explain concept B
-3. Then difference
-4. Then SQL query
-5. Then real-world use
-
-Example:
-Left Join → explain  
-Right Join → explain  
-Difference → explain  
-SQL → query  
-
----
-
-### 🔥 NEW: DATA STRUCTURE EXPLANATION (MANDATORY FOR CODING)
-
-Whenever writing code:
-- ALWAYS mention:
-  - which data structure you are using
-  - WHY you are using it
-  - what alternative you considered (optional but good)
-
----
-
-### 🔥 NEW: HUMAN THINKING FLOW (VERY IMPORTANT)
-
-Your answer should feel like you're thinking out loud:
-
-- "So first I’d..."
-- "Then I’d check..."
-- "One thing I’d be careful about is..."
-- "In real-world..."
-
-DO NOT sound like documentation.
-
----
-
-TONE RULES — CRITICAL:
-- Write like a human speaking in an interview, not a textbook.
-- Use first-person: "I'd start by...", "The way I think about it...", "One thing I'd be careful about..."
-- No robotic phrasing. Bad: "Utilize a mocking framework to simulate dependencies." Good: "I'd mock the dependency so I can control what it returns without hitting the real service."
-- No excessive bolding or bullet dumps. flowing, natural sentences.
-
----
-
-HARD RULES — NEVER BREAK THESE:
-- NEVER start your response with code.
-- NEVER skip the Concept section.
-- NEVER skip the "Questions I'd ask" section.
-- NEVER skip the Approach section.
-- If you are unsure whether code is needed, DO NOT write code. Explain instead.
-- ALWAYS adapt answer based on detected question type.
-- ALWAYS guide step-by-step for complex problems.
-- ALWAYS include example usage when code is present.
-- Preserve all code indentation exactly. Wrap code in fenced blocks with language label, e.g. ```python.
-"""
+def _normalize_user_input(user_input: str) -> str:
+    cleaned_input = (user_input or "").strip()
+    if len(cleaned_input) <= MAX_USER_INPUT_CHARS:
+        return cleaned_input
+    return cleaned_input[:MAX_USER_INPUT_CHARS]
 
 
 class AIBridge:
     _CACHE_MAX = 20  # maximum number of cached responses
+    _MAX_CONTINUATIONS = 2
 
     def __init__(self, db):
         self.db = db
@@ -278,6 +143,19 @@ class AIBridge:
         self._response_cache[normalized] = value
         if len(self._response_cache) > self._CACHE_MAX:
             self._response_cache.popitem(last=False)  # evict oldest
+
+    def _looks_incomplete_response(self, text: str) -> bool:
+        stripped = (text or "").rstrip()
+        if not stripped:
+            return False
+        if stripped.count("```") % 2 != 0:
+            return True
+        if stripped.endswith((":", ",", "(", "[", "{", "=", "->")):
+            return True
+        last_char = stripped[-1]
+        if last_char.isalnum() or last_char in {'_', '"', "'"}:
+            return True
+        return False
 
     async def _ensure_session(self):
         if self.session is None or self.session.closed:
@@ -321,80 +199,168 @@ class AIBridge:
                 payload = await resp.json()
                 return payload.get("text")
 
-    async def ask_gpt(self, text: str, mode: str = "chat", stream: bool = False, on_delta=None, fast: bool = False) -> str | None:
-        # Cache is only applied to non-streaming chat calls (not hints, not streamed)
-        use_cache = (mode == "chat" and not stream)
-        if use_cache:
-            cached = self._cache_get(text)
-            if cached is not None:
-                return cached
-
-        if mode == "hint":
-            prompt = _hint_prompt(text)
-            system_message = "You are a concise interview coach. Return only short, bulleted hints."
-            max_tokens = HINT_MAX_TOKENS
-            messages = [
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt}
-            ]
-        else:
-            prompt = text
-            if fast:
-                system_message = _chat_system_message()
-                max_tokens = CHAT_MAX_TOKENS
-                messages = [
-                    {"role": "system", "content": system_message},
-                    {"role": "user", "content": prompt}
-                ]
-            else:
-                system_message = _chat_system_message()
-                max_tokens = CHAT_MAX_TOKENS
-                messages = [
-                    {"role": "system", "content": system_message},
-                    *self._get_context(3),
-                    {"role": "user", "content": prompt}
-                ]
-
+    async def _execute_chat_request(self, messages, api_model: str, *, stream: bool, on_delta, token_limit: int):
+        stream = CHAT_STREAMING_ENABLED
         payload = {
-            "model": GPT_CHAT_MODEL,
+            "model": api_model,
             "messages": messages,
             "stream": stream,
         }
-        payload.update(_token_limit_field(GPT_CHAT_MODEL, max_tokens))
-        payload.update(_sampling_field(GPT_CHAT_MODEL))
+        payload.update(_token_limit_field(api_model, token_limit))
+        payload.update(_sampling_field(api_model))
 
         session = await self._ensure_session()
-        # Use a streaming-friendly request; when stream=True we'll read the event stream
         async with session.post(GPT_URL, json=payload) as resp:
             if resp.status != 200:
                 try:
                     error_payload = await resp.json()
                 except Exception:
                     error_payload = await resp.text()
-                return f"API error {resp.status}: {error_payload}"
+                return None, None, f"API error {resp.status}: {error_payload}"
 
             if stream:
-                return await self._read_stream_response(resp, text, on_delta)
+                content, finish_reason = await self._read_stream_response(resp, on_delta)
+                return content, finish_reason, None
 
             result = await resp.json()
             if "error" in result:
                 message = result["error"].get("message")
-                return f"API error: {message or result['error']}"
+                return None, None, f"API error: {message or result['error']}"
 
             choice = result.get("choices", [{}])[0]
-            content = choice.get("message", {}).get("content")
+            content = choice.get("message", {}).get("content") or ""
+            finish_reason = choice.get("finish_reason")
+            return content, finish_reason, None
 
-            if content:
-                self.db.save_message("user", text)
-                self.db.save_message("assistant", content)
-                if use_cache:
-                    self._cache_set(text, content)
-                return content
+    async def _continue_response(self, messages, api_model: str, partial_content: str, *, stream: bool, on_delta, token_limit: int) -> str:
+        accumulated = partial_content
+        for _ in range(self._MAX_CONTINUATIONS):
+            continuation_messages = messages + [
+                {"role": "assistant", "content": accumulated},
+                {
+                    "role": "user",
+                    "content": "Continue exactly from where you stopped. Do not repeat earlier text. Finish any open code blocks, strings, lists, or sentences. Return only the remaining text.",
+                },
+            ]
+            extra_content, finish_reason, error = await self._execute_chat_request(
+                continuation_messages,
+                api_model,
+                stream=stream,
+                on_delta=on_delta,
+                token_limit=token_limit,
+            )
+            if error or not extra_content:
+                break
+            accumulated += extra_content
+            if finish_reason != "length":
+                break
+        return accumulated
 
-            return f"API returned no message: {result}"
+    async def generateResponse(self, userInput: str, selectedModel: str, *, stream: bool = True, on_delta=None, include_context: bool = True, token_limit: int | None = None) -> str | None:
+        stream = CHAT_STREAMING_ENABLED
+        cache_key = f"{selectedModel}::{userInput}"
+        use_cache = not stream
+        if use_cache:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached
 
-    async def _read_stream_response(self, resp, text: str, on_delta):
+        api_model = _resolve_model(selectedModel)
+        messages = [{"role": "system", "content": BASE_SYSTEM_MESSAGE}]
+        messages.extend(_instruction_messages(selectedModel))
+        if include_context:
+            messages.extend(self._get_context(3))
+        messages.append({"role": "user", "content": _normalize_user_input(userInput)})
+
+        resolved_token_limit = token_limit if token_limit is not None else _resolve_token_limit(api_model)
+        content, finish_reason, error = await self._execute_chat_request(
+            messages,
+            api_model,
+            stream=stream,
+            on_delta=on_delta,
+            token_limit=resolved_token_limit,
+        )
+        if error:
+            return error
+
+        content = content or ""
+        if content and (finish_reason == "length" or self._looks_incomplete_response(content)):
+            content = await self._continue_response(
+                messages,
+                api_model,
+                content,
+                stream=stream,
+                on_delta=on_delta,
+                token_limit=resolved_token_limit,
+            )
+
+        if content:
+            self.db.save_message("user", userInput)
+            self.db.save_message("assistant", content)
+            if use_cache:
+                self._cache_set(cache_key, content)
+            return content
+
+        return "API returned no visible content."
+
+    async def ask_gpt(self, text: str, mode: str = "chat", stream: bool = True, on_delta=None, fast: bool = False, selected_model: str = GPT4O_MODEL, include_context: bool | None = None) -> str | None:
+        stream = CHAT_STREAMING_ENABLED
+        if mode == "hint":
+            prompt = _hint_prompt(text)
+            messages = [
+                {"role": "system", "content": _model_prompt(GPT_HINT_MODEL)},
+                {"role": "user", "content": prompt},
+            ]
+            payload = {
+                "model": GPT_HINT_MODEL,
+                "messages": messages,
+                "stream": stream,
+            }
+            payload.update(_token_limit_field(GPT_HINT_MODEL, HINT_MAX_TOKENS))
+            payload.update(_sampling_field(GPT_HINT_MODEL))
+
+            session = await self._ensure_session()
+            async with session.post(GPT_URL, json=payload) as resp:
+                if resp.status != 200:
+                    try:
+                        error_payload = await resp.json()
+                    except Exception:
+                        error_payload = await resp.text()
+                    return f"API error {resp.status}: {error_payload}"
+
+                if stream:
+                    content, finish_reason = await self._read_stream_response(resp, on_delta)
+                    if content and (finish_reason == "length" or self._looks_incomplete_response(content)):
+                        content = await self._continue_response(
+                            messages,
+                            GPT_HINT_MODEL,
+                            content,
+                            stream=stream,
+                            on_delta=on_delta,
+                            token_limit=HINT_MAX_TOKENS,
+                        )
+                    return content
+
+                result = await resp.json()
+                if "error" in result:
+                    message = result["error"].get("message")
+                    return f"API error: {message or result['error']}"
+
+                choice = result.get("choices", [{}])[0]
+                return choice.get("message", {}).get("content")
+
+        api_model = _resolve_model(selected_model)
+        if selected_model == GPT5_MODEL and fast:
+            token_limit = GPT5_FAST_MAX_TOKENS
+        else:
+            token_limit = _resolve_token_limit(api_model)
+        if include_context is None:
+            include_context = mode == "chat"
+        return await self.generateResponse(text, selected_model, stream=stream, on_delta=on_delta, include_context=include_context, token_limit=token_limit)
+
+    async def _read_stream_response(self, resp, on_delta):
         content = ""
+        finish_reason = None
         while True:
             line_bytes = await resp.content.readline()
             if not line_bytes:
@@ -411,19 +377,17 @@ class AIBridge:
             payload = json.loads(line[len("data:"):].strip())
             if "error" in payload:
                 message = payload["error"].get("message")
-                return f"API error: {message or payload['error']}"
+                return f"API error: {message or payload['error']}", "error"
 
-            delta = payload.get("choices", [{}])[0].get("delta", {}).get("content", "")
+            choice = payload.get("choices", [{}])[0]
+            finish_reason = choice.get("finish_reason") or finish_reason
+            delta = choice.get("delta", {}).get("content", "")
             if delta:
                 content += delta
                 if on_delta:
                     on_delta(delta)
 
-        if content:
-            self.db.save_message("user", text)
-            self.db.save_message("assistant", content)
-
-        return content
+        return content, finish_reason
 
     async def stream_gpt(self, text: str):
         """Async generator that yields partial response tokens as they arrive.
@@ -432,59 +396,28 @@ class AIBridge:
             async for token in bridge.stream_gpt("your question"):
                 print(token, end="", flush=True)
         """
-        system_message = _chat_system_message()
-        messages = [
-            {"role": "system", "content": system_message},
-            *self._get_context(3),
-            {"role": "user", "content": text},
-        ]
-        payload = {
-            "model": GPT_CHAT_MODEL,
-            "messages": messages,
-            "stream": True,
-        }
-        payload.update(_token_limit_field(GPT_CHAT_MODEL, CHAT_MAX_TOKENS))
-        payload.update(_sampling_field(GPT_CHAT_MODEL))
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-        session = await self._ensure_session()
-        async with session.post(GPT_URL, json=payload) as resp:
-            if resp.status != 200:
-                try:
-                    error_payload = await resp.json()
-                except Exception:
-                    error_payload = await resp.text()
-                yield f"API error {resp.status}: {error_payload}"
-                return
+        def _on_delta(delta: str) -> None:
+            queue.put_nowait(delta)
 
-            full_content = []
-            async for line_bytes in resp.content:
-                line = line_bytes.decode("utf-8").strip()
-                if not line:
-                    continue
-                if line == "data: [DONE]":
+        async def _run_request() -> None:
+            try:
+                await self.generateResponse(text, GPT4O_MODEL, stream=True, on_delta=_on_delta, include_context=False)
+            finally:
+                queue.put_nowait(None)
+
+        task = asyncio.create_task(_run_request())
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
                     break
-                if not line.startswith("data:"):
-                    continue
-
-                try:
-                    chunk = json.loads(line[len("data:"):].strip())
-                except json.JSONDecodeError:
-                    continue
-
-                if "error" in chunk:
-                    message = chunk["error"].get("message")
-                    yield f"API error: {message or chunk['error']}"
-                    return
-
-                delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
-                if delta:
-                    full_content.append(delta)
-                    yield delta
-
-            assembled = "".join(full_content)
-            if assembled:
-                self.db.save_message("user", text)
-                self.db.save_message("assistant", assembled)
+                yield chunk
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
 
     async def process(self, wav_path: str) -> tuple[str | None, str | None]:
         transcript = await self.transcribe(wav_path)
