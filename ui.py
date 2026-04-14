@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import asyncio
+import concurrent.futures
 import tkinter as tk
 from ctypes import wintypes
 from pathlib import Path
@@ -34,7 +35,7 @@ class OverlayApp:
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.7)
-        self.root.geometry("520x320+100+100")
+        self.root.geometry("640x320+100+100")
         self.root.configure(bg="#111111")
 
         self.drag_offset = (0, 0)
@@ -212,6 +213,19 @@ class OverlayApp:
         )
         self.send_button.pack(side="left", padx=(6, 0))
 
+        self.stop_button = tk.Button(
+            prompt_frame,
+            text="Stop",
+            command=self._handle_stop_action,
+            width=10,
+            bg="#b94e44",
+            fg="white",
+            relief="flat",
+            state="disabled"
+        )
+        self.stop_button.pack(side="left", padx=(6, 0))
+        self.cancel_send_button = self.stop_button
+
         # Mic toggle for interview listening (non-disruptive)
         try:
             self.listener_button = tk.Button(
@@ -278,6 +292,8 @@ class OverlayApp:
         # capture state
         self._last_ocr = None
         self._capture_cancelled = False
+        self._pending_auto_send_id = None
+        self._response_stop_requested = False
 
     def _set_selected_model(self, model_name: str):
         self.selected_model = model_name
@@ -300,6 +316,54 @@ class OverlayApp:
     def _has_active_request(self) -> bool:
         future = getattr(self, '_current_ai_future', None)
         return bool(future and not future.done())
+
+    def _set_stop_button_enabled(self, enabled: bool):
+        try:
+            self.stop_button.config(state="normal" if enabled else "disabled")
+        except Exception:
+            pass
+
+    def _register_active_future(self, future):
+        self._current_ai_future = future
+        self._response_stop_requested = False
+        self._set_stop_button_enabled(True)
+
+    def _clear_active_future(self, future=None):
+        current = getattr(self, '_current_ai_future', None)
+        if future is not None and current is not future:
+            return
+        try:
+            delattr(self, '_current_ai_future')
+        except Exception:
+            pass
+        self._response_stop_requested = False
+        if not self._pending_auto_send_id:
+            self._set_stop_button_enabled(False)
+
+    def _is_cancelled_request_error(self, future, exc: Exception) -> bool:
+        return bool(
+            getattr(self, '_response_stop_requested', False)
+            or (future and future.cancelled())
+            or isinstance(exc, (asyncio.CancelledError, concurrent.futures.CancelledError))
+        )
+
+    def _handle_stop_action(self):
+        if self._pending_auto_send_id:
+            self._cancel_pending_capture()
+            return
+        self._stop_active_request()
+
+    def _stop_active_request(self):
+        if not self._has_active_request():
+            self._set_stop_button_enabled(False)
+            return
+        self._response_stop_requested = True
+        self._set_stop_button_enabled(False)
+        self._cancel_current_stream(remove_partial=False)
+        try:
+            self.status_label.config(text="Response stopped.", fg="#ffb347")
+        except Exception:
+            pass
 
     def _on_move(self, event):
         x = self.root.winfo_x() + event.x - self.drag_offset[0]
@@ -360,8 +424,8 @@ class OverlayApp:
         except Exception:
             pass
 
-    def _cancel_current_stream(self):
-        """Attempt to cancel any in-progress AI future and remove partial assistant output."""
+    def _cancel_current_stream(self, remove_partial: bool = True):
+        """Attempt to cancel any in-progress AI future and optionally remove partial assistant output."""
         try:
             fut = getattr(self, '_current_ai_future', None)
             if fut and not fut.done():
@@ -372,22 +436,23 @@ class OverlayApp:
         except Exception:
             pass
 
-        # remove partial assistant text from the UI if a stream anchor exists
-        try:
-            anchor = getattr(self, '_assistant_stream_anchor', None)
-            if anchor:
-                def _del():
+        if remove_partial:
+            # remove partial assistant text from the UI if a stream anchor exists
+            try:
+                anchor = getattr(self, '_assistant_stream_anchor', None)
+                if anchor:
+                    def _del():
+                        try:
+                            self.log.delete(anchor, tk.END)
+                        except Exception:
+                            pass
+                    self.root.after(0, _del)
                     try:
-                        self.log.delete(anchor, tk.END)
+                        delattr(self, '_assistant_stream_anchor')
                     except Exception:
                         pass
-                self.root.after(0, _del)
-                try:
-                    delattr(self, '_assistant_stream_anchor')
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     def _finish_assistant_stream(self):
         try:
@@ -658,17 +723,15 @@ class OverlayApp:
                 self.ai.ask_gpt(conv, mode="chat", stream=True, on_delta=self._append_assistant_chunk, selected_model=selected_model, include_context=False),
                 self.loop,
             )
-            self._current_ai_future = future
+            self._register_active_future(future)
             try:
                 future.result(timeout=300)
             except Exception as exc:
-                self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Conversion error: {type(exc).__name__}: {exc}'))
+                if not self._is_cancelled_request_error(future, exc):
+                    self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Conversion error: {type(exc).__name__}: {exc}'))
             finally:
                 self.root.after(0, self._finish_assistant_stream)
-                try:
-                    delattr(self, '_current_ai_future')
-                except Exception:
-                    pass
+                self._clear_active_future(future)
         except Exception as exc:
             try:
                 self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Conversion unexpected error: {type(exc).__name__}: {exc}'))
@@ -768,6 +831,10 @@ class OverlayApp:
 
     def stop(self):
         try:
+            self._cancel_current_stream(remove_partial=False)
+        except Exception:
+            pass
+        try:
             self.root.destroy()
         except Exception:
             pass
@@ -799,19 +866,16 @@ class OverlayApp:
                 self.ai.ask_gpt(prompt, mode="chat", stream=True, on_delta=self._append_assistant_chunk, selected_model=selected_model, include_context=True),
                 self.loop,
             )
-            # track current AI future so it can be cancelled if needed
-            self._current_ai_future = future
+            self._register_active_future(future)
             try:
                 # extended timeout to avoid truncated/early termination of streaming responses
                 response = future.result(timeout=300)
                 self.root.after(0, lambda response=response: self._hydrate_stream_buffer_from_result(response))
             except Exception as exc:
-                self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Chat error: {type(exc).__name__}: {exc}'))
+                if not self._is_cancelled_request_error(future, exc):
+                    self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Chat error: {type(exc).__name__}: {exc}'))
             self.root.after(0, self._finish_assistant_stream)
-            try:
-                delattr(self, '_current_ai_future')
-            except Exception:
-                pass
+            self._clear_active_future(future)
         except Exception as exc:
             try:
                 self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Chat error: {type(exc).__name__}: {exc}'))
@@ -1110,19 +1174,17 @@ class OverlayApp:
                 self.ai.ask_gpt(forced, mode="chat", stream=True, on_delta=self._append_assistant_chunk, selected_model=selected_model, include_context=False),
                 self.loop,
             )
-            self._current_ai_future = future
+            self._register_active_future(future)
             try:
                 # extended timeout for capture-triggered requests
                 response = future.result(timeout=300)
                 self.root.after(0, lambda response=response: self._hydrate_stream_buffer_from_result(response))
             except Exception as exc:
-                self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Auto-send error: {type(exc).__name__}: {exc}'))
+                if not self._is_cancelled_request_error(future, exc):
+                    self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Auto-send error: {type(exc).__name__}: {exc}'))
             finally:
                 self.root.after(0, self._finish_assistant_stream)
-                try:
-                    delattr(self, '_current_ai_future')
-                except Exception:
-                    pass
+                self._clear_active_future(future)
         except Exception as exc:
             try:
                 self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Auto-send unexpected error: {type(exc).__name__}: {exc}'))
@@ -1139,16 +1201,18 @@ class OverlayApp:
                 self.ai.ask_gpt(prompt, mode="chat", stream=True, on_delta=self._append_assistant_chunk, selected_model=selected_model, include_context=False),
                 self.loop,
             )
-            self._current_ai_future = future
-            response = future.result(timeout=90)
-            self.root.after(0, lambda response=response: self._hydrate_stream_buffer_from_result(response))
-            if not response:
-                self.root.after(0, lambda: self.log_message("assistant", "No response received."))
-            self.root.after(0, self._finish_assistant_stream)
+            self._register_active_future(future)
             try:
-                delattr(self, '_current_ai_future')
-            except Exception:
-                pass
+                response = future.result(timeout=90)
+                self.root.after(0, lambda response=response: self._hydrate_stream_buffer_from_result(response))
+                if not response:
+                    self.root.after(0, lambda: self.log_message("assistant", "No response received."))
+            except Exception as exc:
+                if not self._is_cancelled_request_error(future, exc):
+                    raise
+            finally:
+                self.root.after(0, self._finish_assistant_stream)
+                self._clear_active_future(future)
         except Exception as exc:
             self.root.after(0, lambda exc=exc: self.log_message("assistant", f"Capture chat error: {type(exc).__name__}: {exc}"))
         finally:
@@ -2062,19 +2126,17 @@ class OverlayApp:
                 self.ai.ask_gpt(forced, mode="chat", stream=True, on_delta=self._append_assistant_chunk, selected_model=selected_model, include_context=False),
                 self.loop,
             )
-            self._current_ai_future = future
+            self._register_active_future(future)
             try:
                 response = future.result(timeout=120)
                 self.root.after(0, lambda response=response: self._hydrate_stream_buffer_from_result(response))
             except Exception as exc:
-                self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Auto-send error: {type(exc).__name__}: {exc}'))
+                if not self._is_cancelled_request_error(future, exc):
+                    self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Auto-send error: {type(exc).__name__}: {exc}'))
         except Exception as exc:
             self.root.after(0, lambda exc=exc: self.log_message('assistant', f'Auto-send failed: {exc}'))
         finally:
-            try:
-                delattr(self, '_current_ai_future')
-            except Exception:
-                pass
+            self._clear_active_future(future if 'future' in locals() else None)
             try:
                 self.root.after(0, self._finish_assistant_stream)
             except Exception:

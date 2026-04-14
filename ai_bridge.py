@@ -2,6 +2,7 @@ import aiohttp
 import asyncio
 import json
 import os
+import re
 from collections import OrderedDict
 from pathlib import Path
 
@@ -14,6 +15,7 @@ COMMON_PROMPT_PATH = PROMPTS_DIR / "common_prompt.txt"
 GPT4O_PROMPT_PATH = PROMPTS_DIR / "gpt_4o.txt"
 GPT4O_MINI_PROMPT_PATH = PROMPTS_DIR / "gpt_4o_mini.txt"
 GPT5_PROMPT_PATH = PROMPTS_DIR / "gpt_5.txt"
+GENERIC_ANSWERS_PATH = PROMPTS_DIR / "generic_answers.jsonl"
 GPT4O_MODEL = "gpt-4o"
 GPT5_MODEL = "gpt-5"
 GPT_HINT_MODEL = "gpt-4o-mini"
@@ -30,6 +32,76 @@ DEFAULT_GPT4O_PROMPT = "Keep the response concise, clean, and practical."
 DEFAULT_GPT4O_MINI_PROMPT = "You are a concise interview coach. Return only short, bulleted hints."
 DEFAULT_GPT5_PROMPT = "Give a more complete and precise answer while staying structured and readable."
 BASE_SYSTEM_MESSAGE = "You are a helpful interview coach. Follow the provided instructions exactly."
+
+DEFAULT_GENERIC_ANSWERS = {
+    "introduce_yourself": (
+        "Sure. I’m a software engineer who likes working on practical backend and product problems, especially where I need to move from an idea to a working solution quickly. In my recent work, I’ve spent a lot of time on Python applications, API integrations, debugging, automation, and making systems more reliable under real usage. I’m usually at my best when the problem is a mix of engineering depth and execution, because I enjoy breaking things down, fixing root causes, and keeping the solution clean and maintainable."
+    ),
+    "roles_and_responsibilities": (
+        "In my recent role, I was responsible for taking features from requirement to delivery. That included understanding the use case, designing the implementation, writing and testing the code, debugging issues, and making sure the final behavior was reliable in real usage. I also spent time improving existing flows where latency, stability, or usability were not good enough. So my work was not just writing code, it was owning the outcome end to end and making practical engineering decisions along the way."
+    ),
+    "strengths": (
+        "One of my biggest strengths is that I’m very practical when solving engineering problems. I can usually break a vague issue into smaller parts quickly, identify what actually matters, and move toward a solution without adding unnecessary complexity. Another strength is debugging. I’m comfortable tracing behavior across components, finding the real cause, and fixing it in a way that holds up instead of just patching the symptom. I’d also say I have a strong sense of ownership, so I focus on whether the final result actually works for the user, not just whether the code compiles."
+    ),
+    "weaknesses": (
+        "One weakness I’ve worked on is that I can spend too much time refining an implementation when I already have something that is good enough for the current need. Earlier, I used to optimize details a bit too early because I wanted the solution to feel complete from the start. Over time, I’ve improved that by being more deliberate about scope, shipping the version that solves the actual problem first, and then iterating only where the impact is real. That has helped me balance quality with speed much better."
+    ),
+}
+
+_GENERIC_ANSWERS_CACHE_MTIME = None
+_GENERIC_ANSWERS_CACHE = None
+
+GENERIC_QUESTION_PATTERNS = {
+    "introduce_yourself": {
+        "strong_phrases": (
+            "tell me about yourself",
+            "introduce yourself",
+            "can you introduce yourself",
+            "walk me through your background",
+            "give me a quick background",
+            "tell me about your background",
+            "quick introduction",
+            "brief introduction",
+        ),
+        "token_groups": (("introduce", "introduction", "intro", "background"), ("yourself", "your", "you")),
+    },
+    "roles_and_responsibilities": {
+        "strong_phrases": (
+            "roles and responsibilities",
+            "role and responsibilities",
+            "what were your responsibilities",
+            "what was your role",
+            "day to day responsibilities",
+            "what did you do in your last role",
+            "walk me through your role",
+            "your current role",
+        ),
+        "token_groups": (("role", "roles", "responsibilities", "responsibility"), ("current", "last", "recent", "day", "work")),
+    },
+    "strengths": {
+        "strong_phrases": (
+            "what are your strengths",
+            "what is your greatest strength",
+            "what is your biggest strength",
+            "tell me your strengths",
+            "strong points",
+            "your strengths",
+        ),
+        "token_groups": (("strength", "strengths", "strong", "strongest"), ("your", "you", "biggest", "greatest")),
+    },
+    "weaknesses": {
+        "strong_phrases": (
+            "what are your weaknesses",
+            "what is your biggest weakness",
+            "what is your greatest weakness",
+            "tell me your weaknesses",
+            "area of improvement",
+            "areas of improvement",
+            "one weakness",
+        ),
+        "token_groups": (("weakness", "weaknesses", "weak", "improvement"), ("your", "you", "biggest", "greatest", "area", "areas")),
+    },
+}
 
 
 def _is_gpt5_family(model: str) -> bool:
@@ -115,6 +187,225 @@ def _normalize_user_input(user_input: str) -> str:
     if len(cleaned_input) <= MAX_USER_INPUT_CHARS:
         return cleaned_input
     return cleaned_input[:MAX_USER_INPUT_CHARS]
+
+
+def _normalize_intent_text(text: str) -> str:
+    normalized = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _normalize_answer_key(key: str) -> str:
+    return re.sub(r"\s+", "_", _normalize_intent_text(key))
+
+
+def _stem_token(token: str) -> str:
+    if len(token) > 5 and token.endswith("ing"):
+        return token[:-3]
+    if len(token) > 4 and token.endswith("ed"):
+        return token[:-2]
+    if len(token) > 4 and token.endswith("es"):
+        return token[:-2]
+    if len(token) > 3 and token.endswith("s"):
+        return token[:-1]
+    return token
+
+
+def _tokenize_for_match(text: str) -> set[str]:
+    normalized = _normalize_intent_text(text)
+    return {_stem_token(token) for token in normalized.split() if token}
+
+
+def _load_relaxed_json_object(raw_text: str):
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", raw_text)
+    return json.loads(cleaned, strict=False)
+
+
+def _extract_answer_pairs_from_text(raw_text: str) -> dict[str, str]:
+    pairs = {}
+    pattern = re.compile(r'"(?P<key>[^"\\]+)"\s*:\s*"(?P<value>(?:[^"\\]|\\.|\r|\n)*)"', re.DOTALL)
+    for match in pattern.finditer(raw_text):
+        key = match.group("key")
+        value = bytes(match.group("value"), "utf-8").decode("unicode_escape").strip()
+        if key and value:
+            pairs[key] = value
+    return pairs
+
+
+def _generic_answers() -> dict[str, str]:
+    global _GENERIC_ANSWERS_CACHE_MTIME, _GENERIC_ANSWERS_CACHE
+
+    try:
+        stat = GENERIC_ANSWERS_PATH.stat()
+        mtime_ns = stat.st_mtime_ns
+        if _GENERIC_ANSWERS_CACHE is not None and _GENERIC_ANSWERS_CACHE_MTIME == mtime_ns:
+            return dict(_GENERIC_ANSWERS_CACHE)
+
+        raw_text = GENERIC_ANSWERS_PATH.read_text(encoding="utf-8-sig").strip()
+        if not raw_text:
+            return dict(DEFAULT_GENERIC_ANSWERS)
+
+        merged = dict(DEFAULT_GENERIC_ANSWERS)
+
+        # Backward-compatible path: accept a single JSON object even if the file
+        # has a .jsonl extension.  Skip this path for multi-line JSONL files
+        # (where every line is its own JSON object).
+        _other_lines = [l.strip() for l in raw_text.splitlines()[1:] if l.strip()]
+        _is_jsonl = bool(_other_lines) and _other_lines[0].startswith("{")
+        if raw_text.startswith("{") and not _is_jsonl:
+            try:
+                payload = _load_relaxed_json_object(raw_text)
+                if isinstance(payload, dict):
+                    for key, value in payload.items():
+                        if isinstance(key, str) and isinstance(value, str) and value.strip():
+                            merged[key] = value.strip()
+                    _GENERIC_ANSWERS_CACHE_MTIME = mtime_ns
+                    _GENERIC_ANSWERS_CACHE = dict(merged)
+                    return merged
+            except json.JSONDecodeError:
+                extracted_pairs = _extract_answer_pairs_from_text(raw_text)
+                if extracted_pairs:
+                    merged.update(extracted_pairs)
+                    _GENERIC_ANSWERS_CACHE_MTIME = mtime_ns
+                    _GENERIC_ANSWERS_CACHE = dict(merged)
+                    return merged
+
+        for raw_line in raw_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line, strict=False)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+
+            answer_id = payload.get("id") or payload.get("key") or payload.get("question_type")
+            answer_text = payload.get("answer") or payload.get("text") or payload.get("response")
+
+            if isinstance(answer_id, str) and isinstance(answer_text, str) and answer_text.strip():
+                merged[answer_id] = answer_text.strip()
+                continue
+
+            if len(payload) == 1:
+                only_key, only_value = next(iter(payload.items()))
+                if isinstance(only_key, str) and isinstance(only_value, str) and only_value.strip():
+                    merged[only_key] = only_value.strip()
+
+        _GENERIC_ANSWERS_CACHE_MTIME = mtime_ns
+        _GENERIC_ANSWERS_CACHE = dict(merged)
+        return merged
+    except OSError:
+        pass
+    except json.JSONDecodeError:
+        pass
+    return dict(DEFAULT_GENERIC_ANSWERS)
+
+
+def _match_company_role_question(normalized: str, tokens: set[str], answers: dict[str, str]) -> str | None:
+    role_cues = {
+        "role", "roles", "work", "worked", "responsibility", "responsibilities",
+        "did", "do", "explain", "tell", "describe", "about",
+    }
+    prepositions = {"at", "in", "with", "for"}
+
+    role_cue_tokens = {_stem_token(cue) for cue in role_cues}
+    if not tokens.intersection(role_cue_tokens):
+        return None
+
+    for answer_id, answer_text in answers.items():
+        normalized_id = _normalize_answer_key(answer_id)
+        match = re.match(r"^role_work_(?:at|in)_(.+)$", normalized_id)
+        if not match or not answer_text.strip():
+            continue
+
+        company_slug = match.group(1).strip("_")
+        if not company_slug:
+            continue
+
+        company_phrase = company_slug.replace("_", " ")
+        company_tokens = {part for part in company_slug.split("_") if part and part not in prepositions}
+        has_company_match = company_phrase in normalized or (company_tokens and company_tokens.issubset(tokens))
+        if has_company_match:
+            return answer_text
+
+    return None
+
+
+def _match_named_generic_answer(query_tokens: set[str], answers: dict[str, str]) -> str | None:
+    stop_tokens = {"the", "a", "an", "what", "tell", "me", "about", "your", "did", "do", "in", "at", "for"}
+    filtered_query_tokens = {token for token in query_tokens if token not in stop_tokens}
+    if not filtered_query_tokens:
+        return None
+
+    best_answer = None
+    best_score = 0.0
+
+    for answer_id, answer_text in answers.items():
+        if not answer_text or not answer_text.strip():
+            continue
+
+        answer_tokens = {
+            token for token in _tokenize_for_match(answer_id.replace("_", " "))
+            if token not in {"role", "work", "main"}
+        }
+        if not answer_tokens:
+            continue
+
+        overlap = filtered_query_tokens & answer_tokens
+        if len(overlap) < 2 and not (len(overlap) == 1 and len(filtered_query_tokens) == 1):
+            continue
+
+        score = len(overlap) / len(answer_tokens)
+        if overlap == filtered_query_tokens:
+            score += 0.25
+        score += 0.05 * len(overlap)
+        if score > best_score:
+            best_score = score
+            best_answer = answer_text
+
+    if best_score < 0.45:
+        return None
+    return best_answer
+
+
+def _match_generic_question(text: str) -> str | None:
+    normalized = _normalize_intent_text(text)
+    if not normalized:
+        return None
+
+    tokens = _tokenize_for_match(normalized)
+    answers = _generic_answers()
+
+    company_role_answer = _match_company_role_question(normalized, tokens, answers)
+    if company_role_answer:
+        return company_role_answer
+
+    named_generic_answer = _match_named_generic_answer(tokens, answers)
+    if named_generic_answer:
+        return named_generic_answer
+
+    best_match = None
+    best_score = 0.0
+
+    for answer_id, rule in GENERIC_QUESTION_PATTERNS.items():
+        phrases = rule.get("strong_phrases", ())
+        if any(phrase in normalized for phrase in phrases):
+            score = 1.0
+        else:
+            groups = rule.get("token_groups", ())
+            matched_groups = sum(1 for group in groups if any(_stem_token(token) in tokens for token in group))
+            score = matched_groups / max(1, len(groups))
+            if matched_groups and any(token in normalized for token in ("tell", "walk", "introduce", "describe", "what", "give")):
+                score += 0.1
+
+        if score > best_score:
+            best_score = score
+            best_match = answer_id
+
+    if best_score < 0.95:
+        return None
+    return answers.get(best_match)
 
 
 class AIBridge:
@@ -258,6 +549,14 @@ class AIBridge:
 
     async def generateResponse(self, userInput: str, selectedModel: str, *, stream: bool = True, on_delta=None, include_context: bool = True, token_limit: int | None = None) -> str | None:
         stream = CHAT_STREAMING_ENABLED
+        generic_answer = _match_generic_question(userInput)
+        if generic_answer:
+            if on_delta:
+                on_delta(generic_answer)
+            self.db.save_message("user", userInput)
+            self.db.save_message("assistant", generic_answer)
+            return generic_answer
+
         cache_key = f"{selectedModel}::{userInput}"
         use_cache = not stream
         if use_cache:

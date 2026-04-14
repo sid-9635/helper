@@ -39,7 +39,9 @@ class LiveInterviewListener:
         selected_model: str = "gpt-4o",
         samplerate: int = 16000,
         channels: int = 1,
-        chunk_seconds: float = 0.2,    # 200 ms blocks — fast VAD with low latency
+        chunk_seconds: float = 0.15,   # 150 ms blocks — faster end-of-speech detection
+        end_silence_seconds: float = 0.65,
+        min_speech_seconds: float = 0.45,
         rms_threshold: float = 0.01,
     ):
         self.ai = ai
@@ -53,16 +55,41 @@ class LiveInterviewListener:
         self.samplerate = samplerate
         self.channels = channels
         self.chunk_seconds = max(0.1, chunk_seconds)  # floor at 100 ms
+        self.end_silence_seconds = max(self.chunk_seconds, end_silence_seconds)
+        self.min_speech_seconds = max(self.chunk_seconds, min_speech_seconds)
         self.rms_threshold = rms_threshold
 
         self._thread = None
         self._stop_event = threading.Event()
         self._running = False
 
+        # Pending audio from an incomplete sentence (interviewer paused mid-phrase)
+        self._pending_audio = None          # np.ndarray or None
+        self._pending_sr: int = 16000
+        self._pending_time: float = 0.0
+        self._pending_lock = threading.Lock()
+
     # ── interview filter ──────────────────────────────────────────────────────
 
     # Set to True to log filter decisions via on_status.
     debug_filter: bool = False
+
+    # Words that, when at the end of a transcript, indicate the interviewer
+    # paused mid-sentence (e.g. "debug API using…").  The audio is held and
+    # stitched with the next incoming speech before being sent to Whisper/GPT.
+    _INCOMPLETE_TAILS = frozenset({
+        # prepositions
+        "using", "with", "to", "in", "on", "at", "by", "for", "from", "of",
+        "about", "between", "through", "into", "without", "under", "within",
+        "across", "beyond", "like", "as",
+        # conjunctions
+        "and", "or", "but", "because", "although", "while", "if", "when", "than",
+        # articles
+        "a", "an", "the",
+    })
+    # How long (seconds) to wait for the sentence to resume before giving up
+    # and dispatching the fragment as-is.
+    _INCOMPLETE_TIMEOUT: float = 6.0
 
     _INTERVIEW_KEYWORDS = (
         # question words / prompts
@@ -143,6 +170,19 @@ class LiveInterviewListener:
         if self.debug_filter:
             self._emit(f"filter:skip (no keyword) {stripped!r}")
         return False
+
+    def _looks_incomplete(self, text: str) -> bool:
+        """Return True if the transcript ends with a dangling word that indicates
+        the speaker paused mid-sentence (preposition, conjunction, or article).
+
+        Example: "how do you debug API using" → True
+                 "how do you debug API using wireshark" → False
+        """
+        stripped = text.strip().rstrip(".,!?").strip()
+        if not stripped:
+            return False
+        last_word = stripped.split()[-1].lower()
+        return last_word in self._INCOMPLETE_TAILS
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -303,7 +343,17 @@ class LiveInterviewListener:
         }
         wav_path = None
         try:
-            combined = np.concatenate(buf)
+            # If a prior flush was held because the sentence looked incomplete,
+            # prepend that audio so Whisper sees the full utterance in one shot.
+            extra = None
+            with self._pending_lock:
+                if self._pending_audio is not None:
+                    age = time.time() - self._pending_time
+                    if age <= self._INCOMPLETE_TIMEOUT:
+                        extra = self._pending_audio
+                    self._pending_audio = None  # always clear — don't double-use
+
+            combined = np.concatenate(([extra] if extra is not None else []) + buf)
             wav_path = self._write_wav(combined, use_sr)
 
             fut = run_coroutine_threadsafe(
@@ -327,6 +377,18 @@ class LiveInterviewListener:
                     self.on_transcript(transcript)
             except Exception:
                 pass
+
+            # If the sentence ends with a dangling word (e.g. "debug API using"),
+            # the interviewer likely paused mid-utterance.  Hold the audio and wait
+            # for the next flush — it will prepend this audio and re-transcribe the
+            # full sentence before sending it to GPT.
+            if not partial and self._looks_incomplete(transcript):
+                with self._pending_lock:
+                    self._pending_audio = combined
+                    self._pending_sr = use_sr
+                    self._pending_time = time.time()
+                self._emit(f"incomplete: buffering '{transcript.strip()}'")
+                return
 
             if not self._is_interview_relevant(transcript):
                 self._emit("answer:skipped")  # signal UI to clear Thinking... placeholder
@@ -394,12 +456,12 @@ class LiveInterviewListener:
             use_ch = min(self.channels, int(info.get("max_input_channels") or 1))
 
         BLOCK = int(use_sr * self.chunk_seconds)            # samples per callback block
-        SILENCE_END    = max(1, round(1.2 / self.chunk_seconds))   # ~1.2 s silence → flush
-        MIN_SPEECH     = max(1, round(0.6 / self.chunk_seconds))   # ~0.6 s minimum speech
+        SILENCE_END    = max(1, round(self.end_silence_seconds / self.chunk_seconds))
+        MIN_SPEECH     = max(1, round(self.min_speech_seconds / self.chunk_seconds))
         MAX_CHUNKS     = max(5, round(10.0 / self.chunk_seconds))  # ~10 s → force-flush
         PARTIAL_CHUNKS = max(MIN_SPEECH + 1, round(3.0 / self.chunk_seconds))  # early partial mark
         HEARTBEAT      = max(1, round(5.0 / self.chunk_seconds))   # rms log every ~5 s
-        Q_TIMEOUT      = self.chunk_seconds + 0.1                  # queue.get timeout
+        Q_TIMEOUT      = self.chunk_seconds + 0.05                 # queue.get timeout
 
         device_name = info.get("name") if info else "unknown"
         self._emit(
@@ -446,6 +508,16 @@ class LiveInterviewListener:
                             speech_buf = []
                             silence_chunks = 0
                             partial_dispatched = False
+                    # Flush a held incomplete fragment if no follow-up arrived in time
+                    _stale = None
+                    with self._pending_lock:
+                        if (self._pending_audio is not None and
+                                (time.time() - self._pending_time) > self._INCOMPLETE_TIMEOUT):
+                            _stale = self._pending_audio
+                            self._pending_audio = None
+                    if _stale is not None:
+                        self._emit("incomplete: timeout — flushing as-is")
+                        self._dispatch_flush([_stale], use_sr)
                     continue
 
                 arr = chunk.flatten().astype(np.int16)
@@ -490,3 +562,9 @@ class LiveInterviewListener:
         # flush anything left when stopped
         if speech_buf:
             self._flush(speech_buf[:], use_sr)
+        # also flush any held incomplete audio so the question isn't lost
+        with self._pending_lock:
+            _pending_stale = self._pending_audio
+            self._pending_audio = None
+        if _pending_stale is not None:
+            self._flush([_pending_stale], use_sr)
