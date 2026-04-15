@@ -9,3 +9,95 @@
 {"id":"automation_vs_manual_testing","answer":"I decide what to automate based on ROI. My goal is to automate anything that saves time in the long run, while keeping manual testing for areas that require human judgment.\n\nWhat I automate includes regression tests for stable features that need to be checked every release, high-volume data-driven scenarios where the same action must be tested with many inputs, repetitive sanity checks that must run frequently, and technical scenarios that humans cannot realistically execute, such as race conditions or concurrent API traffic.\n\nWhat I keep manual includes exploratory testing for new features, usability and UI review, frequently changing features where automation would be too costly to maintain, and one-time checks where the setup cost of automation is higher than the value it would provide.\n\nIn short, I use automation for scale, speed, and repeatability, and manual testing where observation, judgment, and flexibility matter more."}
 {"id":"production_issue_browser_specific_css_bug","answer":"STAR Method: The Browser-Specific CSS Bug\n\nSituation: At Everbridge, we released a critical update to the Emergency Contact form. In staging, our automated Selenium tests passed in Chrome, and my manual smoke test in Chrome also looked fine. Shortly after release, a client using Safari on a specific iPad version reported that the Submit button was hidden behind a footer, making the form unusable.\n\nTask: As the lead QA, I had to identify why a blocker issue reached users even though the release looked clean in testing.\n\nAction: I reproduced the issue in BrowserStack using the same iPad and Safari version. I then analyzed the gap and found that our automation suite was heavily Chrome-focused to save execution time, and our manual sanity checks also prioritized Chrome. To fix the process, I updated our Playwright or Selenium configuration to include WebKit coverage in the mandatory pull request checks.\n\nResult: We shipped a hotfix within two hours. More importantly, I introduced a cross-browser core suite that runs on Chrome, Firefox, and Safari for every release. Since then, we have had no UI-related production escapes on non-Chrome browsers."}
 {"id":"high_pressure_keycloak_sso_mfa","answer":"STAR Method: Keycloak SSO and MFA Integration under High Pressure\n\nSituation: At Everbridge, we were migrating our authentication system to Keycloak. The final integration was merged just six hours before a global release. If the authentication flow failed, clients ranging from emergency dispatchers to government admins could have been locked out of the system.\n\nTask: With the go/no-go meeting only four hours away, I had to provide a high-confidence sign-off on single sign-on, multi-factor authentication, and session token stability across user roles.\n\nAction: I used a layered automation strategy to compress days of testing into hours. Instead of relying only on UI flows, I used a Python and PyTest script to hit the Keycloak token endpoint directly and simulate 50 concurrent direct-grant requests to verify JWT issuance under load. To automate MFA, I partnered with developers to use a test-only TOTP secret, and my automation used pyotp to generate valid six-digit codes dynamically. I also focused UI checks on redirect URI handling across desktop and mobile, which helped catch a configuration issue where mobile deep-link redirects were being rejected.\n\nResult: We identified the redirect URI mismatch within the first 90 minutes, the team pushed a configuration fix before the go/no-go meeting, and the release went smoothly. I presented Grafana results showing a 100 percent token success rate and roughly 200 millisecond average authentication time, and I received a spot award for helping prevent a global authentication failure."}
+{"id":"How Did you developed end to end automation framework","answer":"So I built a Pytest-based API automation framework from scratch. 
+
+I started by structuring it properly — I kept test cases, API calls, and validations separate so the framework stays clean and reusable.
+
+For authentication, I implemented a Keycloak-based token mechanism, so before executing APIs, we generate and reuse tokens instead of handling auth in every test.
+
+I created a separate request builder class, which was responsible for constructing API payloads dynamically, and a data validation layer to verify responses in a structured way instead of writing assertions everywhere.
+
+For logging, I built a dedicated logging class so we get proper logs for each step, which really helped during debugging.
+
+I also integrated Allure reports, where I added meaningful test steps and attached request/response data, so failures were easy to analyze without going through raw logs.
+
+I used Pytest fixtures for setup and teardown, and implemented hooks to handle things like logging test execution and capturing failures centrally.
+
+To avoid duplication, I moved common operations like JSON parsing and reusable logic into utility classes, so the framework stayed clean and maintainable.
+
+Once the framework was stable, I containerized it using Docker and integrated it with GitLab CI/CD, so tests run automatically on every deployment and can scale with parallel execution.
+
+Overall, it made test creation faster, reduced duplication, and improved debugging and reporting significantly. \\n Main goal was to avoid duplication and make it reusable across teams, so separating responsibilities made it easier to scale and maintain \\n Handling authentication and flaky APIs was tricky initially, so centralizing auth and adding proper logging and retries made the framework much more stable"},
+
+{"id":"Reusable Libraries","answer":"So in our setup, we had a common base framework in a shared remote repo, and on top of that, each team used to build their own test frameworks.
+
+I contributed to that base layer by developing reusable libraries, so instead of every team solving the same problems, they could just use what I built.
+
+For example, I created an authentication library (eb_auth) where I handled different types of authentication like Keycloak and others. So from a user’s perspective, they just needed to call a method and pass required keys, and the library handled token generation and management internally.
+
+I also built a JSON parsing utility, because some APIs had very large and nested responses. Instead of writing complex parsing logic every time, users could just call my utility and extract only the required fields in a clean way.
+
+Similarly, I developed a soft assertion library, which acted as a wrapper over Pytest assertions, so we could validate multiple fields in a single test without failing at the first error.
+
+The idea was to reduce repeated effort and make things simpler for teams, and over time these libraries became a common way of working across different frameworks 
+
+Along with that, I developed a retry mechanism to handle flaky APIs, where instead of failing immediately, tests would retry a few times with configurable delays, which helped stabilize execution.
+
+I also created a schema validator for structured response validation, so instead of writing repetitive assertions, we could define the expected response format once and validate it in a consistent and reusable way. 
+assert response["id"] is not None
+assert response["name"] is not None
+assert isinstance(response["age"], int)
+schema = {
+    "id": int,
+    "name": str,
+    "age": int
+}" }
+{"id":"why did you build a wrapper on soft asseertions we already have assertion in pytest?","answer": "Yes, Pytest already provides assertions, but the problem was that it stops execution at the first failure.
+
+In API testing, we usually validate multiple fields in a single response, so if the first assertion fails, we lose visibility on other issues.
+
+So I built a soft assertion wrapper where we can collect all validation failures and report them together at the end of the test.
+
+This helped in better debugging because instead of fixing one issue at a time, we could see all failures in one go.
+
+So I implemented soft assertions by basically collecting all assertion failures instead of raising them immediately.
+
+I created a small utility class where each validation would be wrapped in a method, and instead of failing the test, it would store the failure message in a list.
+
+At the end of the test, I added a final check — if the list is not empty, then I fail the test with all the collected errors together.
+
+So during execution, whenever a validation fails, I don’t raise an assertion error immediately — I just log it and store it.
+
+Once all validations are done, I call a method like assert_all(), which checks if there are any failures collected, and if yes, it raises a single assertion error with all failure details.
+
+class SoftAssert:
+    def __init__(self):
+        self.errors = []
+
+    def check(self, condition, message):
+        if not condition:
+            self.errors.append(message)
+
+    def assert_all(self):
+        if self.errors:
+            raise AssertionError("\n".join(self.errors))
+            
+            sa = SoftAssert()
+
+sa.check(response["status"] == 200, "Status code mismatch")
+sa.check(response["name"] == "John", "Name mismatch")
+
+sa.assert_all()"}
+{"id": "Tell me about a time you built a Slack bot for tracking QA work", "answer": {"situation": "During a QA workshop, we noticed that our estimations were not matching actual effort, and tasks were consistently taking longer than planned.", "task": "We wanted to understand where the extra time was going, especially manual efforts like setup, validation, and debugging which were not being tracked properly.", "action": "Instead of manual tracking, I built a Slack bot that sent a daily notification around 5:30 PM to the QA team. It included dropdown-based inputs where users could log time spent on different activities like manual testing, automation, and setup. The responses were collected and stored in a structured format like JSON/Excel for analysis.", "result": "This gave us clear visibility into actual effort distribution. Based on this data, we improved our sprint estimations, identified areas with high manual effort, and made better planning decisions. It significantly reduced the gap between planned and actual work."}}
+{"id":"","answer":""}
+{"id":"","answer":""}
+{"id":"","answer":""}
+{"id":"","answer":""}
+{"id":"","answer":""}
+{"id":"","answer":""}
+{"id":"","answer":""}
+{"id":"","answer":""}
+{"id":"","answer":""}
+{"id":"","answer":""}
+{"id":"","answer":""}
+{"id":"","answer":""}
