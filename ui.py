@@ -1426,6 +1426,15 @@ class OverlayApp:
             self.log_message("system", "Capture failed: Pillow not installed. Install 'pillow' in the venv.")
             return
 
+        # grab typed prompt text (if any) and clear the entry before capture
+        user_prompt = self.prompt_entry.get().strip()
+        if user_prompt:
+            self.prompt_entry.delete(0, tk.END)
+            self.log_message('user', user_prompt)
+
+        # grab attached file path before capture so it can be sent along
+        attached_file_for_capture = getattr(self, '_attached_file', None)
+
         # disable capture controls and hide overlay, then grab on the mainloop shortly after
         try:
             self.header_capture.config(state='disabled')
@@ -1462,7 +1471,7 @@ class OverlayApp:
                 return
 
             # process OCR in background to avoid blocking UI
-            threading.Thread(target=self._process_captured_image, args=(img,), daemon=True).start()
+            threading.Thread(target=self._process_captured_image, args=(img, user_prompt, attached_file_for_capture), daemon=True).start()
 
         # schedule grab after 150ms to allow withdraw to take effect
         self.root.after(150, _grab_on_main)
@@ -2445,8 +2454,13 @@ class OverlayApp:
         digit_count = sum(ch.isdigit() for ch in text)
         return len(text.strip()) >= 60 and (alpha_count + digit_count) >= 25
 
-    def _process_captured_image(self, img):
-        """Background processing of a captured PIL image: OCR, logging, and scheduling send."""
+    def _process_captured_image(self, img, user_prompt="", attached_file_override=None):
+        """Background processing of a captured PIL image: OCR, logging, and scheduling send.
+
+        If *user_prompt* is provided it becomes the primary query and the OCR
+        text is treated as supporting context (e.g. a dataset on screen).
+        If *attached_file_override* is given it is used instead of self._attached_file.
+        """
         if self._has_active_request():
             self.root.after(0, lambda: self.log_message('system', 'A request is already running.'))
             return
@@ -2541,7 +2555,7 @@ class OverlayApp:
 
         # Include any attached file in the capture prompt
         attached_section = ""
-        attached_file = getattr(self, '_attached_file', None)
+        attached_file = attached_file_override if attached_file_override else getattr(self, '_attached_file', None)
         if attached_file:
             file_content = self._read_file_content(attached_file)
             file_name = Path(attached_file).name
@@ -2551,18 +2565,30 @@ class OverlayApp:
             self._clear_attached_file()
 
         # Build forced prompt for coding-interview interpretation (concise, runnable Python)
-        forced = (
-            "The OCR below comes from a noisy full-screen capture and may include editor tabs, file trees, terminal text, previous assistant output, timestamps, and unrelated desktop text. "
-            "Ignore that noise and focus on the most likely user question or task. Use the focused task text first, then the raw OCR only as backup context. "
-            f"If a clear task is present, answer it with a concise, runnable {lang} solution. "
-            "If the task is vague, choose the simplest practical real-world interpretation first. Do not invent extra features such as thread safety, async behavior, rotation, multiple handlers, metadata fields, retries, or scalability unless the captured text asks for them. "
-            "If there still is not enough signal, reply exactly with: SCREEN_CAPTURE_TOO_NOISY: Use region capture around the question.\n\n"
-            f"Fallback mode: {'yes' if using_fallback_context else 'no'}\n\n"
-            "Focused task text:\n" + candidate_text + "\n\n"
-            "Raw OCR excerpt:\n" + raw_excerpt
-            + attached_section
-            + f"\n\nAdditionally: if you include code, keep it concise, runnable, and focused on the requested solution. Respond using {lang} code blocks where applicable. Do not add long explanations unless needed."
-        )
+        if user_prompt:
+            # User typed an explicit query — treat it as the primary task, OCR as context/data
+            forced = (
+                f"User query: {user_prompt}\n\n"
+                "The following OCR text was captured from the screen and may contain relevant data, a dataset, code, or additional context for the query above. "
+                "Use it to fulfill the user's request.\n\n"
+                "Focused task text:\n" + candidate_text + "\n\n"
+                "Raw OCR excerpt:\n" + raw_excerpt
+                + attached_section
+                + f"\n\nRespond using {lang} code blocks where applicable. Keep the answer concise, runnable, and focused on the requested solution."
+            )
+        else:
+            forced = (
+                "The OCR below comes from a noisy full-screen capture and may include editor tabs, file trees, terminal text, previous assistant output, timestamps, and unrelated desktop text. "
+                "Ignore that noise and focus on the most likely user question or task. Use the focused task text first, then the raw OCR only as backup context. "
+                f"If a clear task is present, answer it with a concise, runnable {lang} solution. "
+                "If the task is vague, choose the simplest practical real-world interpretation first. Do not invent extra features such as thread safety, async behavior, rotation, multiple handlers, metadata fields, retries, or scalability unless the captured text asks for them. "
+                "If there still is not enough signal, reply exactly with: SCREEN_CAPTURE_TOO_NOISY: Use region capture around the question.\n\n"
+                f"Fallback mode: {'yes' if using_fallback_context else 'no'}\n\n"
+                "Focused task text:\n" + candidate_text + "\n\n"
+                "Raw OCR excerpt:\n" + raw_excerpt
+                + attached_section
+                + f"\n\nAdditionally: if you include code, keep it concise, runnable, and focused on the requested solution. Respond using {lang} code blocks where applicable. Do not add long explanations unless needed."
+            )
 
         # start streaming response into UI with minimal latency
         try:

@@ -100,3 +100,123 @@ Before answering, verify:
 - Is OpenAI + LangChain used? ✅
 
 If NOT → rewrite
+
+
+==================================================
+ML / AI DEVELOPMENT RULES (STRICT - HIGH PRIORITY)
+==================================================
+
+If the prompt contains:
+- "Build ML model"
+- "Implement ML algorithm"
+- "AI system"
+- "Prediction / classification / regression"
+- "Train model"
+- "Churn prediction / recommendation / anomaly detection"
+
+→ ALWAYS follow these rules:
+
+--------------------------------------------------
+OUTPUT STRUCTURE (MANDATORY)
+--------------------------------------------------
+
+You MUST follow this exact order:
+
+1. THEORY
+2. PSEUDOCODE
+3. JUPYTER NOTEBOOK CODE
+
+--------------------------------------------------
+THEORY SECTION (MANDATORY)
+--------------------------------------------------
+
+- Clearly explain:
+  - Which ML algorithm is used
+  - WHY this algorithm is chosen
+  - Type of problem (classification / regression / clustering)
+
+- Keep it practical (not textbook)
+- Include one limitation
+
+--------------------------------------------------
+PSEUDOCODE (STRICT)
+--------------------------------------------------
+
+- Step-by-step logic
+- Must include:
+  - Data loading
+  - Preprocessing
+  - Train-test split
+  - Model training
+  - Prediction
+  - Evaluation
+- Must include sub-steps (5a, 5b, etc.)
+- Must include final output step
+
+--------------------------------------------------
+JUPYTER NOTEBOOK MODE (MANDATORY)
+--------------------------------------------------
+
+- Code must be split into multiple cells
+- Each cell must be numbered:
+
+# CELL 1: Imports
+# CELL 2: Data Loading
+# CELL 3: Preprocessing
+# CELL 4: Model Training
+# CELL 5: Evaluation
+
+--------------------------------------------------
+CODE RULES (STRICT)
+--------------------------------------------------
+
+- EVERY line must have a comment explaining WHAT it does
+- Functions must explain WHAT and WHY
+- Loops must explain WHAT and WHY
+- Important ML steps must explain WHY (model choice, scaling, etc.)
+
+--------------------------------------------------
+IMPORT RULE (MANDATORY)
+--------------------------------------------------
+
+- EVERY cell must include imports
+- Use standard libraries:
+  - pandas
+  - numpy
+  - sklearn
+
+--------------------------------------------------
+ML PIPELINE (MANDATORY)
+--------------------------------------------------
+
+Your implementation MUST include:
+
+1. Data loading / mock data
+2. Preprocessing
+3. Train-test split
+4. Model training
+5. Prediction
+6. Evaluation (accuracy, precision, recall, F1 if classification)
+
+--------------------------------------------------
+ANTI-DEVIATION RULE
+--------------------------------------------------
+
+- DO NOT skip steps
+- DO NOT give only theory
+- DO NOT give only code
+- DO NOT merge all code into one block
+- DO NOT skip comments
+
+--------------------------------------------------
+FINAL CHECK
+--------------------------------------------------
+
+Before answering, verify:
+- Is THEORY present? ✅
+- Is PSEUDOCODE present? ✅
+- Are notebook cells numbered? ✅
+- Does every line have comments? ✅
+- Is full ML pipeline implemented? ✅
+
+If NOT → rewrite
