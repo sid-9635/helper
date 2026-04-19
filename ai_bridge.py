@@ -269,14 +269,36 @@ def _generic_answers() -> dict[str, str]:
                     _GENERIC_ANSWERS_CACHE = dict(merged)
                     return merged
 
-        for raw_line in raw_text.splitlines():
-            line = raw_line.strip()
+        lines = raw_text.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
             if not line:
+                i += 1
                 continue
+
+            # Try single-line parse first (fast path for properly formatted JSONL)
+            payload = None
             try:
                 payload = json.loads(line, strict=False)
+                i += 1
             except json.JSONDecodeError:
-                continue
+                # Multi-line entry: accumulate lines until valid JSON
+                accumulated = line
+                parsed = False
+                for j in range(i + 1, len(lines)):
+                    accumulated += "\n" + lines[j]
+                    try:
+                        payload = json.loads(accumulated, strict=False)
+                        i = j + 1
+                        parsed = True
+                        break
+                    except json.JSONDecodeError:
+                        continue
+                if not parsed:
+                    i += 1
+                    continue
+
             if not isinstance(payload, dict):
                 continue
 
@@ -333,7 +355,20 @@ def _match_company_role_question(normalized: str, tokens: set[str], answers: dic
 
 
 def _match_named_generic_answer(query_tokens: set[str], answers: dict[str, str]) -> str | None:
-    stop_tokens = {"the", "a", "an", "what", "tell", "me", "about", "your", "did", "do", "in", "at", "for"}
+    stop_tokens = {
+        "the", "a", "an", "what", "tell", "me", "about", "your", "did", "do",
+        "in", "at", "for", "of", "and", "or", "to", "is", "it", "how", "with",
+        "that", "this", "which", "using", "used", "you", "can", "are", "was",
+        "has", "have", "had", "should", "would", "will", "be", "by", "from",
+        "on", "not", "but", "also", "so", "if", "more", "than", "very",
+    }
+    # Common generic words that appear across many answer IDs and cause false matches
+    _id_noise_tokens = {
+        "role", "work", "main", "result", "help", "better", "faster",
+        "overall", "ensur", "high", "end", "input", "output", "field",
+        "write", "code", "list", "provid", "under", "time",
+        "system", "design", "implement", "simple", "explain",
+    }
     filtered_query_tokens = {token for token in query_tokens if token not in stop_tokens}
     if not filtered_query_tokens:
         return None
@@ -347,39 +382,48 @@ def _match_named_generic_answer(query_tokens: set[str], answers: dict[str, str])
 
         answer_tokens = {
             token for token in _tokenize_for_match(answer_id.replace("_", " "))
-            if token not in {"role", "work", "main"}
+            if token not in _id_noise_tokens and token not in stop_tokens
         }
         if not answer_tokens:
             continue
 
-        overlap = filtered_query_tokens & answer_tokens
+        # Also filter noise from query side for scoring purposes
+        effective_query = filtered_query_tokens - _id_noise_tokens
+        if not effective_query:
+            effective_query = filtered_query_tokens
+
+        overlap = effective_query & answer_tokens
         if not overlap:
             continue
 
         # Allow single-token overlap only when:
         # - the query itself is a single token, OR
-        # - the overlapping token is a specific/technical term (len > 5), meaning it's
-        #   unlikely to be a coincidental match (e.g. "kubernetes", "grafana", "docker")
+        # - the overlapping token is a specific/technical term (len > 5 or in known set)
+        _known_short_terms = {"rag", "css", "mfa", "sso", "ocr", "llm"}
         if len(overlap) < 2:
-            has_specific_term = any(len(t) > 5 for t in overlap)
-            if len(filtered_query_tokens) != 1 and not has_specific_term:
+            has_specific_term = any(len(t) > 5 or t in _known_short_terms for t in overlap)
+            if len(effective_query) != 1 and not has_specific_term:
                 continue
 
-        # Use the maximum of answer-side and query-side coverage so that long
-        # compound IDs (e.g. microservices_aws_kubernetes_docker_port_forwarding)
-        # are not unfairly penalised when the query's key term is clearly present.
-        score = max(
-            len(overlap) / len(answer_tokens),
-            len(overlap) / len(filtered_query_tokens),
-        )
-        if overlap == filtered_query_tokens:
+        answer_coverage = len(overlap) / len(answer_tokens)
+        query_coverage = len(overlap) / len(effective_query)
+
+        # For long sentence-like IDs (many tokens), require meaningful overlap.
+        # Generic short words like "api", "test" alone shouldn't match long IDs.
+        if len(answer_tokens) > 5 and answer_coverage < 0.20:
+            has_specific_overlap = any(len(t) > 5 or t in _known_short_terms for t in overlap)
+            if not has_specific_overlap:
+                continue
+
+        score = max(answer_coverage, query_coverage)
+        if overlap == effective_query:
             score += 0.25
         score += 0.05 * len(overlap)
         if score > best_score:
             best_score = score
             best_answer = answer_text
 
-    if best_score < 0.35:
+    if best_score < 0.40:
         return None
     return best_answer
 
