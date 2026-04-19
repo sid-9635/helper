@@ -16,7 +16,7 @@ GPT4O_PROMPT_PATH = PROMPTS_DIR / "gpt_4o.txt"
 GPT4O_MINI_PROMPT_PATH = PROMPTS_DIR / "gpt_4o_mini.txt"
 GPT5_PROMPT_PATH = PROMPTS_DIR / "gpt_5.txt"
 GENERIC_ANSWERS_PATH = PROMPTS_DIR / "generic_answers.jsonl"
-GPT4O_MODEL = "gpt-4o"
+GPT4O_MODEL = "gpt-4.1"
 GPT5_MODEL = "gpt-5"
 GPT_HINT_MODEL = "gpt-4o-mini"
 GPT4O_MAX_TOKENS = 5324
@@ -353,10 +353,25 @@ def _match_named_generic_answer(query_tokens: set[str], answers: dict[str, str])
             continue
 
         overlap = filtered_query_tokens & answer_tokens
-        if len(overlap) < 2 and not (len(overlap) == 1 and len(filtered_query_tokens) == 1):
+        if not overlap:
             continue
 
-        score = len(overlap) / len(answer_tokens)
+        # Allow single-token overlap only when:
+        # - the query itself is a single token, OR
+        # - the overlapping token is a specific/technical term (len > 5), meaning it's
+        #   unlikely to be a coincidental match (e.g. "kubernetes", "grafana", "docker")
+        if len(overlap) < 2:
+            has_specific_term = any(len(t) > 5 for t in overlap)
+            if len(filtered_query_tokens) != 1 and not has_specific_term:
+                continue
+
+        # Use the maximum of answer-side and query-side coverage so that long
+        # compound IDs (e.g. microservices_aws_kubernetes_docker_port_forwarding)
+        # are not unfairly penalised when the query's key term is clearly present.
+        score = max(
+            len(overlap) / len(answer_tokens),
+            len(overlap) / len(filtered_query_tokens),
+        )
         if overlap == filtered_query_tokens:
             score += 0.25
         score += 0.05 * len(overlap)
@@ -364,12 +379,16 @@ def _match_named_generic_answer(query_tokens: set[str], answers: dict[str, str])
             best_score = score
             best_answer = answer_text
 
-    if best_score < 0.45:
+    if best_score < 0.35:
         return None
     return best_answer
 
 
 def _match_generic_question(text: str) -> str | None:
+    # Screen captures and coding prompts produce long blobs — never match them
+    # against generic Q&A. Real interview questions are always short (< 300 chars).
+    if len(text) > 300:
+        return None
     normalized = _normalize_intent_text(text)
     if not normalized:
         return None
@@ -418,6 +437,10 @@ class AIBridge:
         self._cached_api_key = None
         self._response_cache: OrderedDict[str, str] = OrderedDict()
 
+    def match_generic_answer(self, text: str) -> str | None:
+        """Return a stored generic answer if *text* matches one, else None."""
+        return _match_generic_question(text)
+
     def _cache_get(self, key: str) -> str | None:
         """Return cached response for *key*, promoting it to most-recent."""
         normalized = key.strip().lower()
@@ -454,9 +477,15 @@ class AIBridge:
             if not self._cached_api_key:
                 self._cached_api_key = _get_api_key()
 
-            # create a session with a connector tuned for low-latency reuse
-            timeout = aiohttp.ClientTimeout(total=300)
-            connector = aiohttp.TCPConnector(limit=20, force_close=False, ssl=None)
+            # tuned for low-latency: DNS cached for 120s, 4s connect timeout, keepalive
+            timeout = aiohttp.ClientTimeout(total=300, connect=4)
+            connector = aiohttp.TCPConnector(
+                limit=20,
+                force_close=False,
+                ssl=None,
+                ttl_dns_cache=120,
+                enable_cleanup_closed=True,
+            )
             self.session = aiohttp.ClientSession(
                 headers={"Authorization": f"Bearer {self._cached_api_key}"},
                 timeout=timeout,
@@ -464,6 +493,13 @@ class AIBridge:
                 trust_env=True,
             )
         return self.session
+
+    async def warmup(self):
+        """Pre-open the HTTP session and resolve DNS so the first real request has no cold-start delay."""
+        try:
+            await self._ensure_session()
+        except Exception:
+            pass
 
     async def close(self):
         if self.session is not None and not self.session.closed:
@@ -678,7 +714,10 @@ class AIBridge:
                 message = payload["error"].get("message")
                 return f"API error: {message or payload['error']}", "error"
 
-            choice = payload.get("choices", [{}])[0]
+            choices = payload.get("choices")
+            if not choices:
+                continue
+            choice = choices[0]
             finish_reason = choice.get("finish_reason") or finish_reason
             delta = choice.get("delta", {}).get("content", "")
             if delta:

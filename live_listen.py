@@ -36,7 +36,7 @@ class LiveInterviewListener:
         on_answer: Optional[Callable[[str], None]] = None,
         on_status: Optional[Callable[[str], None]] = None,
         preferred_device: Optional[int] = None,
-        selected_model: str = "gpt-4o",
+        selected_model: str = "gpt-4.1",
         samplerate: int = 16000,
         channels: int = 1,
         chunk_seconds: float = 0.15,   # 150 ms blocks — faster end-of-speech detection
@@ -97,6 +97,8 @@ class LiveInterviewListener:
         "tell me", "can you", "could you", "walk me through", "give me",
         "describe", "when would you", "where would you", "which one",
         "advantages", "disadvantages", "use case", "scenario", "example",
+        "introduce yourself", "tell us about yourself", "about yourself",
+        "walk us through", "your background", "your experience",
         # engineering actions
         "implement", "write", "code", "design", "approach", "solution",
         "optimize", "improve", "debug", "fix", "issue", "problem",
