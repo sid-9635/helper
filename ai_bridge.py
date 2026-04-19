@@ -150,11 +150,13 @@ def _common_prompt() -> str:
 
 
 def _model_prompt(selected_model: str) -> str:
+    base = _read_prompt_file(GPT4O_PROMPT_PATH, DEFAULT_GPT4O_PROMPT)
     if selected_model == GPT5_MODEL:
-        return _read_prompt_file(GPT5_PROMPT_PATH, DEFAULT_GPT5_PROMPT)
+        extra = _read_prompt_file(GPT5_PROMPT_PATH, DEFAULT_GPT5_PROMPT)
+        return base + "\n\n" + extra if extra else base
     if selected_model == GPT_HINT_MODEL:
         return _read_prompt_file(GPT4O_MINI_PROMPT_PATH, DEFAULT_GPT4O_MINI_PROMPT)
-    return _read_prompt_file(GPT4O_PROMPT_PATH, DEFAULT_GPT4O_PROMPT)
+    return base
 
 
 def _instruction_messages(selected_model: str) -> list[dict[str, str]]:
@@ -645,8 +647,16 @@ class AIBridge:
                 return cached
 
         api_model = _resolve_model(selectedModel)
-        messages = [{"role": "system", "content": BASE_SYSTEM_MESSAGE}]
-        messages.extend(_instruction_messages(selectedModel))
+        # Merge all system instructions into a single message so the model
+        # treats them as one coherent block instead of deprioritizing later ones.
+        system_parts = [BASE_SYSTEM_MESSAGE]
+        common = _common_prompt()
+        model = _model_prompt(selectedModel)
+        if common:
+            system_parts.append(common)
+        if model and model != common:
+            system_parts.append(model)
+        messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
         if include_context:
             messages.extend(self._get_context(3))
         messages.append({"role": "user", "content": _normalize_user_input(userInput)})

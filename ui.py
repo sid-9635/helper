@@ -1597,12 +1597,12 @@ class OverlayApp:
             self._pending_auto_send_id = None
             lang = getattr(self, 'lang_var', None).get() if getattr(self, 'lang_var', None) else 'Python'
             forced = (
-                f"Treat the captured text as the task to solve. Produce a concise, runnable {lang} solution that matches the captured request exactly. "
-                "Do not reuse earlier prompts or add unrelated requirements. If the text is ambiguous, state the most practical interpretation briefly and continue. "
+                "Treat the captured text as the task to solve. "
+                "If the text is ambiguous, state the most practical interpretation briefly and continue. "
                 "Prefer the simplest practical real-world implementation. Do not invent extra features such as thread safety, async behavior, rotation, multiple handlers, metadata fields, retries, or scalability unless the captured text asks for them.\n\n"
-                "Captured text:\n" + text + (
-                    f"\n\nAdditionally: if you include code, keep it concise, runnable, and focused on the requested solution. Respond using {lang} code blocks where applicable. Do not add long explanations unless needed."
-                )
+                "IMPORTANT: Follow the system prompt format instructions exactly. Do not skip any required sections.\n\n"
+                "Captured text:\n" + text
+                + f"\n\nUse {lang} for any code sections."
             )
             # start streaming
             self.root.after(0, self._begin_assistant_stream)
@@ -2571,23 +2571,24 @@ class OverlayApp:
                 f"User query: {user_prompt}\n\n"
                 "The following OCR text was captured from the screen and may contain relevant data, a dataset, code, or additional context for the query above. "
                 "Use it to fulfill the user's request.\n\n"
+                "IMPORTANT: Follow the system prompt format instructions exactly. Do not skip any required sections.\n\n"
                 "Focused task text:\n" + candidate_text + "\n\n"
                 "Raw OCR excerpt:\n" + raw_excerpt
                 + attached_section
-                + f"\n\nRespond using {lang} code blocks where applicable. Keep the answer concise, runnable, and focused on the requested solution."
+                + f"\n\nUse {lang} for any code sections."
             )
         else:
             forced = (
                 "The OCR below comes from a noisy full-screen capture and may include editor tabs, file trees, terminal text, previous assistant output, timestamps, and unrelated desktop text. "
                 "Ignore that noise and focus on the most likely user question or task. Use the focused task text first, then the raw OCR only as backup context. "
-                f"If a clear task is present, answer it with a concise, runnable {lang} solution. "
                 "If the task is vague, choose the simplest practical real-world interpretation first. Do not invent extra features such as thread safety, async behavior, rotation, multiple handlers, metadata fields, retries, or scalability unless the captured text asks for them. "
                 "If there still is not enough signal, reply exactly with: SCREEN_CAPTURE_TOO_NOISY: Use region capture around the question.\n\n"
+                "IMPORTANT: Follow the system prompt format instructions exactly. Do not skip any required sections.\n\n"
                 f"Fallback mode: {'yes' if using_fallback_context else 'no'}\n\n"
                 "Focused task text:\n" + candidate_text + "\n\n"
                 "Raw OCR excerpt:\n" + raw_excerpt
                 + attached_section
-                + f"\n\nAdditionally: if you include code, keep it concise, runnable, and focused on the requested solution. Respond using {lang} code blocks where applicable. Do not add long explanations unless needed."
+                + f"\n\nUse {lang} for any code sections."
             )
 
         # start streaming response into UI with minimal latency
