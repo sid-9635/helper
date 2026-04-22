@@ -11,14 +11,11 @@ from config import OPENAI_API_KEY as CONFIG_OPENAI_API_KEY
 WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions"
 GPT_URL = "https://api.openai.com/v1/chat/completions"
 PROMPTS_DIR = Path(__file__).with_name("prompts")
-COMMON_PROMPT_PATH = PROMPTS_DIR / "common_prompt.txt"
 GPT4O_PROMPT_PATH = PROMPTS_DIR / "gpt_4o.txt"
-GPT4O_MINI_PROMPT_PATH = PROMPTS_DIR / "gpt_4o_mini.txt"
 GPT5_PROMPT_PATH = PROMPTS_DIR / "gpt_5.txt"
 GENERIC_ANSWERS_PATH = PROMPTS_DIR / "generic_answers.jsonl"
 GPT4O_MODEL = "gpt-4.1"
 GPT5_MODEL = "gpt-5"
-GPT_HINT_MODEL = "gpt-4o-mini"
 GPT4O_MAX_TOKENS = 5324
 GPT5_MAX_TOKENS = 5200
 GPT5_FAST_MAX_TOKENS = 3600
@@ -27,9 +24,7 @@ MAX_USER_INPUT_CHARS = 12000
 CHAT_STREAMING_ENABLED = True
 
 
-DEFAULT_COMMON_PROMPT = "You are an interview coach. Answer clearly, directly, and naturally."
 DEFAULT_GPT4O_PROMPT = "Keep the response concise, clean, and practical."
-DEFAULT_GPT4O_MINI_PROMPT = "You are a concise interview coach. Return only short, bulleted hints."
 DEFAULT_GPT5_PROMPT = "Give a more complete and precise answer while staying structured and readable."
 BASE_SYSTEM_MESSAGE = "You are a helpful interview coach. Follow the provided instructions exactly."
 
@@ -135,41 +130,21 @@ def _hint_prompt(transcript: str) -> str:
     )
 
 
-def _read_prompt_file(path: Path, fallback: str) -> str:
-    try:
-        content = path.read_text(encoding="utf-8").strip()
-        if content:
-            return content
-    except OSError:
-        pass
-    return fallback
-
-
 def _common_prompt() -> str:
-    return _read_prompt_file(COMMON_PROMPT_PATH, DEFAULT_COMMON_PROMPT)
+    return ""
 
 
 def _model_prompt(selected_model: str) -> str:
-    base = _read_prompt_file(GPT4O_PROMPT_PATH, DEFAULT_GPT4O_PROMPT)
+    base = GPT4O_PROMPT_PATH.read_text(encoding="utf-8").strip() if GPT4O_PROMPT_PATH.exists() else DEFAULT_GPT4O_PROMPT
     if selected_model == GPT5_MODEL:
-        extra = _read_prompt_file(GPT5_PROMPT_PATH, DEFAULT_GPT5_PROMPT)
+        extra = GPT5_PROMPT_PATH.read_text(encoding="utf-8").strip() if GPT5_PROMPT_PATH.exists() else DEFAULT_GPT5_PROMPT
         return base + "\n\n" + extra if extra else base
-    if selected_model == GPT_HINT_MODEL:
-        return _read_prompt_file(GPT4O_MINI_PROMPT_PATH, DEFAULT_GPT4O_MINI_PROMPT)
     return base
 
 
 def _instruction_messages(selected_model: str) -> list[dict[str, str]]:
-    messages = []
-    common_prompt = _common_prompt()
     model_prompt = _model_prompt(selected_model)
-
-    if common_prompt:
-        messages.append({"role": "system", "content": common_prompt})
-    if model_prompt and model_prompt != common_prompt:
-        messages.append({"role": "system", "content": model_prompt})
-
-    return messages
+    return [{"role": "system", "content": model_prompt}] if model_prompt else []
 
 
 def _resolve_model(selected_model: str) -> str:
