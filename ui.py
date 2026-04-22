@@ -38,6 +38,7 @@ class OverlayApp:
     """
 
     def __init__(self):
+        # Start window hidden/minimized to avoid flashing
         if _TK_DND_AVAILABLE:
             try:
                 self.root = _tkdnd.TkinterDnD.Tk()
@@ -57,31 +58,42 @@ class OverlayApp:
         self.root.geometry("640x320+100+100")
         self.root.configure(bg="#111111")
 
+        # Hide window at startup to suppress flash
+        self.root.withdraw()
+
         self.drag_offset = (0, 0)
 
         # async loop and AI bridge for fast streaming responses
         self.db = Database()
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self._start_async_loop, daemon=True).start()
+        # Preload heavy resources in background before showing window
+        self._preload_thread = threading.Thread(target=self._preload_and_show, daemon=True)
+        self._preload_thread.start()
+
+    def _preload_and_show(self):
+        # Preload resources (AI bridge, etc.)
         self.ai = AIBridge(self.db)
         self.selected_model = "gpt-4.1"
-        # pre-warm the AI HTTP session to reduce first-request latency
         try:
             asyncio.run_coroutine_threadsafe(self.ai.warmup(), self.loop)
         except Exception:
             pass
-
         # interview listener (created on demand)
         self._listener = None
+        # Build UI and show window after preload
+        self.root.after(0, self._finish_init_and_show)
 
+    def _finish_init_and_show(self):
         self._build_ui()
-        # apply taskbar-hide styles shortly after UI is built (Windows only)
         try:
             self.root.after(50, self._apply_taskbar_hide)
         except Exception:
             pass
         self.root.after(200, self._hide_from_capture)
         self.root.protocol("WM_DELETE_WINDOW", self.stop)
+        # Now show the window (deiconify)
+        self.root.deiconify()
 
     def _start_async_loop(self):
         asyncio.set_event_loop(self.loop)
@@ -1285,6 +1297,14 @@ class OverlayApp:
                         self.root.after(0, lambda: self.status_label.config(text="Ready for the next prompt.", fg="#50fa7b"))
                         return
 
+            # If the prompt is ML/AI related, enforce gpt_5 strict output structure
+            ml_keywords = [
+                "Build ML model", "Implement ML algorithm", "AI system", "Prediction", "classification", "regression", "Train model", "Churn prediction", "recommendation", "anomaly detection"
+            ]
+            if any(kw.lower() in (prompt or '').lower() for kw in ml_keywords):
+                gpt5_rules = (Path(__file__).parent / "prompts" / "gpt_5.txt").read_text(encoding="utf-8")
+                combined = f"{gpt5_rules}\n\nUSER PROMPT:\n{combined}"
+
             self.root.after(0, lambda: self.status_label.config(text="Answering now...", fg="#a6e22e"))
             self.root.after(0, self._begin_assistant_stream)
 
@@ -1294,8 +1314,19 @@ class OverlayApp:
             )
             self._register_active_future(future)
             try:
-                # extended timeout to avoid truncated/early termination of streaming responses
                 response = future.result(timeout=300)
+                # Validate response for required sections if ML/AI prompt
+                if any(kw.lower() in (prompt or '').lower() for kw in ml_keywords):
+                    missing_sections = []
+                    if not (response and "THEORY" in response.upper()):
+                        missing_sections.append("THEORY")
+                    if not (response and "PSEUDOCODE" in response.upper()):
+                        missing_sections.append("PSEUDOCODE")
+                    if not (response and ("JUPYTER NOTEBOOK CODE" in response.upper() or "NOTEBOOK CODE" in response.upper() or "CELL 1" in response.upper())):
+                        missing_sections.append("JUPYTER NOTEBOOK CODE")
+                    if missing_sections:
+                        warn = f"Warning: Model output is missing required section(s): {', '.join(missing_sections)}. Please check prompt or try again."
+                        self.root.after(0, lambda: self.log_message('system', warn))
                 self.root.after(0, lambda response=response: self._hydrate_stream_buffer_from_result(response))
                 self.root.after(0, self._finish_assistant_stream)
             except Exception as exc:
