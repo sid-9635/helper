@@ -96,6 +96,93 @@ GENERIC_QUESTION_PATTERNS = {
         ),
         "token_groups": (("weakness", "weaknesses", "weak", "improvement"), ("your", "you", "biggest", "greatest", "area", "areas")),
     },
+    "bug_found_significant_appreciation": {
+        "strong_phrases": (
+            "tell me about a time you were appreciated",
+            "tell me about a work where you got appreciation",
+            "describe a situation where you received significant appreciation",
+            "share an example of being recognized for your work",
+            "when did you get appreciation for your work",
+            "work where you got appreciation",
+            "work where you got recognized",
+            "situation where you were appreciated",
+            "example of significant appreciation",
+            "appreciation for your work",
+            "recognized for your work",
+            "praised for your work",
+            "got appreciation",
+            "got recognized",
+            "significant appreciation",
+        ),
+        "token_groups": (("appreciation", "appreciated", "recognized", "recognition", "praised"), ("work", "situation", "example", "time", "significant")),
+    },
+    "reusable_framework_libraries": {
+        "strong_phrases": (
+            "reusable framework",
+            "reusable frameworks",
+            "reusable library",
+            "reusable libraries",
+            "reusable components",
+            "shared library",
+            "shared libraries",
+            "common library",
+            "utility library",
+            "helper library",
+            "internal library",
+            "in-house library",
+            "built a library",
+            "created a library",
+            "developed a library",
+            "wrote a library",
+            "have you built any reusable",
+            "any reusable components you built",
+            "any shared utilities",
+            "reusable utility",
+            "reusable utilities",
+        ),
+        "token_groups": (
+            ("reusable", "framework", "frameworks", "library", "libraries", "utility", "utilities", "shared", "component", "components"),
+            ("built", "created", "developed", "wrote", "written", "designed", "made"),
+        ),
+    },
+    "FULL RAG SYSTEM (DETAILED, ACCURATE FLOW)": {
+        "strong_phrases": (
+            "what is rag",
+            "explain rag",
+            "how does rag work",
+            "retrieval augmented generation",
+            "retrieval-augmented generation",
+            "rag system",
+            "rag pipeline",
+            "rag architecture",
+            "rag framework",
+            "how rag works",
+            "explain retrieval augmented generation",
+            "what is retrieval augmented generation",
+            "how do you implement rag",
+            "rag ingestion pipeline",
+            "rag retrieval pipeline",
+            "vector database rag",
+            "embeddings and rag",
+            "chunking in rag",
+            "hybrid search rag",
+            "reranking in rag",
+            "cosine similarity rag",
+            "rag with history",
+            "rag memory",
+            "multi query retrieval",
+            "maximum marginal relevance",
+            "mmr retrieval",
+            "reciprocal rank fusion",
+            "score threshold retrieval",
+            "semantic chunking",
+            "agentic chunking",
+        ),
+        "token_groups": (
+            ("rag", "retrieval", "augmented", "generation", "augment"),
+            ("pipeline", "system", "architecture", "framework", "implement", "work", "explain", "design", "build"),
+        ),
+    },
 }
 
 
@@ -604,15 +691,28 @@ class AIBridge:
                 break
         return accumulated
 
+
     async def generateResponse(self, userInput: str, selectedModel: str, *, stream: bool = True, on_delta=None, include_context: bool = True, token_limit: int | None = None) -> str | None:
         stream = CHAT_STREAMING_ENABLED
-        generic_answer = _match_generic_question(userInput)
-        if generic_answer:
+        # Try to match a generic answer and get its id
+        answers = _generic_answers()
+        matched_id = None
+        matched_answer = None
+        # Try to find the id for the matched answer
+        for answer_id, answer_text in answers.items():
+            if answer_text.strip() == "":
+                continue
+            if _match_generic_question(userInput) == answer_text:
+                matched_id = answer_id
+                matched_answer = answer_text
+                break
+        if matched_answer:
+            response = f"Question: {matched_id}\nAnswer: {matched_answer}"
             if on_delta:
-                on_delta(generic_answer)
+                on_delta(response)
             self.db.save_message("user", userInput)
-            self.db.save_message("assistant", generic_answer)
-            return generic_answer
+            self.db.save_message("assistant", response)
+            return response
 
         cache_key = f"{selectedModel}::{userInput}"
         use_cache = not stream
