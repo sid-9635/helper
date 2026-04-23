@@ -237,7 +237,7 @@ class OverlayApp:
 
         self.gpt4o_button = tk.Button(
             model_frame,
-            text="GPT-4.1",
+            text="4",
             command=lambda: self._set_selected_model("gpt-4.1"),
             width=8,
             relief="flat",
@@ -246,7 +246,7 @@ class OverlayApp:
 
         self.gpt5_button = tk.Button(
             model_frame,
-            text="GPT-5",
+            text="5",
             command=lambda: self._set_selected_model("gpt-5"),
             width=8,
             relief="flat",
@@ -339,7 +339,7 @@ class OverlayApp:
         # Capture button: screenshot + OCR preview
         self.capture_button = tk.Button(
             button_frame,
-            text="Capture",
+            text="Exit from trade",
             command=self.capture_screen_and_answer,
             width=12,
             bg="#e69900",
@@ -382,11 +382,21 @@ class OverlayApp:
 
         # drag-and-drop: register widgets as drop targets when tkinterdnd2 is available
         if getattr(self, '_dnd_available', False):
+            def _force_arrow_cursor(event=None):
+                try:
+                    event.widget.config(cursor="arrow")
+                except Exception:
+                    pass
+                # Force the drop effect to 'none' to prevent '+' icon
+                return "none"
+
             try:
                 for widget in (self.log, self.prompt_entry, self._file_row, self._file_indicator_label):
                     try:
                         widget.drop_target_register(_tkdnd.DND_FILES)
                         widget.dnd_bind('<<Drop>>', self._handle_drop)
+                        widget.dnd_bind('<DragEnter>', _force_arrow_cursor)
+                        widget.dnd_bind('<DragOver>', _force_arrow_cursor)
                     except Exception:
                         pass
             except Exception:

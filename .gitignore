@@ -8,3 +8,4 @@ tools/
 test.py
 .log
 base_prompt.txt
+generic_answers_copy.jsonl
