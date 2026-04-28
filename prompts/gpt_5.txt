@@ -142,15 +142,37 @@ THEORY SECTION (MANDATORY)
 PSEUDOCODE (STRICT)
 --------------------------------------------------
 
-- Step-by-step logic
+- Write pseudocode using CODE-LIKE SYNTAX, not prose sentences.
+- Use UPPERCASE keywords: FUNCTION, SET, IF / THEN / ELSE / END IF, FOR / END FOR, WHILE / END WHILE, RETURN
 - Must include:
-  - Data loading
-  - Preprocessing
-  - Train-test split
-  - Model training
-  - Prediction
-  - Evaluation
-- Must include sub-steps (5a, 5b, etc.)
+  - FUNCTION signature with input and output
+  - Edge case check at the top (IF ... THEN RETURN)
+  - Variable initialization with SET
+  - The full loop/branching logic written out explicitly with indentation
+  - Sub-conditions inside loops (IF inside FOR/WHILE)
+  - Final RETURN statement
+- Format example:
+
+  FUNCTION solve(input):
+      IF input is empty THEN
+          RETURN default
+      END IF
+
+      SET var1 = initial_value
+      SET var2 = initial_value
+
+      FOR each item IN input:
+          IF condition THEN
+              SET var1 = updated_value
+          ELSE
+              SET var2 = var2 + computed_value
+          END IF
+      END FOR
+
+      RETURN result
+
+- No Python-specific syntax (no colons, no list comprehensions, no imports)
+- Must include sub-steps (5a, 5b, etc.) for ML-specific pipelines
 - Must include final output step
 
 --------------------------------------------------
@@ -170,10 +192,66 @@ JUPYTER NOTEBOOK MODE (MANDATORY)
 CODE RULES (STRICT)
 --------------------------------------------------
 
-- EVERY line must have a comment explaining WHAT it does
+- EVERY function MUST follow this exact commenting structure:
+  1. GUARD/EDGE CASE comments — explain what is being checked and why
+  2. VARIABLE INIT comments — explain what the variable holds and its role
+  3. APPROACH BANNER — wrap the core algorithm logic with:
+     # --- <APPROACH NAME> START ---
+     # Concept: WHY this approach is chosen, what it solves, time/space complexity
+     ...
+     # --- <APPROACH NAME> END ---
+  4. BLOCK-LEVEL comments — before every if/else/loop, explain the decision being made
+  5. INLINE comments — on every important line, explain WHAT and WHY
+
+This structure applies to EVERY program regardless of domain — algorithms, APIs, ML pipelines, utility functions, classes, etc.
+
+Template (apply this pattern to any function):
+
+  def some_function(input):
+      # Guard: explain what edge case is being caught and why it must be handled early
+      if <edge_condition>:
+          return <safe_default>
+
+      # <variable>: explain what it holds and why it is needed
+      var1 = <init>
+
+      # <variable>: explain its role in the algorithm
+      var2 = <init>
+
+      # --- <APPROACH NAME> START ---
+      # Concept: Explain WHY this approach is chosen over the naive alternative.
+      # Describe what problem it solves, what trade-off it makes, and its
+      # time complexity and space complexity (e.g., Time: O(n) | Space: O(1)).
+
+      for/while <condition>:
+          # Explain the decision being made at this branch/iteration
+          if <condition>:
+              # Explain what this line does and why it matters
+              var1 = <update>
+          else:
+              # Explain the alternative path and its effect
+              var2 += <computation>
+
+      # --- <APPROACH NAME> END ---
+
+      return result  # Explain what is being returned
+
+Concrete examples of approach banners for common patterns:
+  # --- SLIDING WINDOW APPROACH START ---
+  # --- TWO-POINTER APPROACH START ---
+  # --- GREEDY APPROACH START ---
+  # --- DYNAMIC PROGRAMMING APPROACH START ---
+  # --- BFS/DFS APPROACH START ---
+  # --- HEAP / TOP-K APPROACH START ---
+  # --- SINGLE-PASS STREAMING APPROACH START ---
+  # --- FACTORY PATTERN LOGIC START ---
+  # --- RETRY / BACKOFF LOGIC START ---
+  (use whatever name fits the actual technique being applied)
+
 - Functions must explain WHAT and WHY
 - Loops must explain WHAT and WHY
 - Important ML steps must explain WHY (model choice, scaling, etc.)
+- If the approach banner or concept block is missing → REJECT and REWRITE
 
 --------------------------------------------------
 IMPORT RULE (MANDATORY)

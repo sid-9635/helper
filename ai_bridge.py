@@ -432,6 +432,7 @@ def _match_named_generic_answer(query_tokens: set[str], answers: dict[str, str])
         "overall", "ensur", "high", "end", "input", "output", "field",
         "write", "code", "list", "provid", "under", "time",
         "system", "design", "implement", "simple", "explain",
+        "stream", "data", "log", "comput", "return", "aggreg",
     }
     filtered_query_tokens = {token for token in query_tokens if token not in stop_tokens}
     if not filtered_query_tokens:
@@ -475,7 +476,7 @@ def _match_named_generic_answer(query_tokens: set[str], answers: dict[str, str])
         # For long sentence-like IDs (many tokens), require meaningful overlap.
         # Generic short words like "api", "test" alone shouldn't match long IDs.
         if len(answer_tokens) > 5 and answer_coverage < 0.20:
-            has_specific_overlap = any(len(t) > 5 or t in _known_short_terms for t in overlap)
+            has_specific_overlap = any(len(t) > 7 or t in _known_short_terms for t in overlap)
             if not has_specific_overlap:
                 continue
 
