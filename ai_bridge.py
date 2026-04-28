@@ -308,7 +308,8 @@ def _generic_answers() -> dict[str, str]:
         if not raw_text:
             return dict(DEFAULT_GENERIC_ANSWERS)
 
-        merged = dict(DEFAULT_GENERIC_ANSWERS)
+        # file_entries preserves the order entries appear in the file
+        file_entries: dict[str, str] = {}
 
         # Backward-compatible path: accept a single JSON object even if the file
         # has a .jsonl extension.  Skip this path for multi-line JSONL files
@@ -321,14 +322,17 @@ def _generic_answers() -> dict[str, str]:
                 if isinstance(payload, dict):
                     for key, value in payload.items():
                         if isinstance(key, str) and isinstance(value, str) and value.strip():
-                            merged[key] = value.strip()
+                            file_entries[key] = value.strip()
+                    # Append DEFAULT fallbacks not already in the file
+                    merged = {**file_entries, **{k: v for k, v in DEFAULT_GENERIC_ANSWERS.items() if k not in file_entries}}
                     _GENERIC_ANSWERS_CACHE_MTIME = mtime_ns
                     _GENERIC_ANSWERS_CACHE = dict(merged)
                     return merged
             except json.JSONDecodeError:
                 extracted_pairs = _extract_answer_pairs_from_text(raw_text)
                 if extracted_pairs:
-                    merged.update(extracted_pairs)
+                    file_entries.update(extracted_pairs)
+                    merged = {**file_entries, **{k: v for k, v in DEFAULT_GENERIC_ANSWERS.items() if k not in file_entries}}
                     _GENERIC_ANSWERS_CACHE_MTIME = mtime_ns
                     _GENERIC_ANSWERS_CACHE = dict(merged)
                     return merged
@@ -370,14 +374,16 @@ def _generic_answers() -> dict[str, str]:
             answer_text = payload.get("answer") or payload.get("text") or payload.get("response")
 
             if isinstance(answer_id, str) and isinstance(answer_text, str) and answer_text.strip():
-                merged[answer_id] = answer_text.strip()
+                file_entries[answer_id] = answer_text.strip()
                 continue
 
             if len(payload) == 1:
                 only_key, only_value = next(iter(payload.items()))
                 if isinstance(only_key, str) and isinstance(only_value, str) and only_value.strip():
-                    merged[only_key] = only_value.strip()
+                    file_entries[only_key] = only_value.strip()
 
+        # File order first; DEFAULT fallbacks that aren't in the file go at the end
+        merged = {**file_entries, **{k: v for k, v in DEFAULT_GENERIC_ANSWERS.items() if k not in file_entries}}
         _GENERIC_ANSWERS_CACHE_MTIME = mtime_ns
         _GENERIC_ANSWERS_CACHE = dict(merged)
         return merged
@@ -547,8 +553,12 @@ class AIBridge:
         self._response_cache: OrderedDict[str, str] = OrderedDict()
 
     def match_generic_answer(self, text: str) -> str | None:
-        """Return a stored generic answer if *text* matches one, else None."""
-        return _match_generic_question(text)
+        """Generic answers are now accessed via the UI sidebar. Always returns None."""
+        return None
+
+    def get_generic_answers(self) -> dict[str, str]:
+        """Return all generic answer key-value pairs for the sidebar."""
+        return _generic_answers()
 
     def _cache_get(self, key: str) -> str | None:
         """Return cached response for *key*, promoting it to most-recent."""
@@ -695,26 +705,7 @@ class AIBridge:
 
     async def generateResponse(self, userInput: str, selectedModel: str, *, stream: bool = True, on_delta=None, include_context: bool = True, token_limit: int | None = None) -> str | None:
         stream = CHAT_STREAMING_ENABLED
-        # Try to match a generic answer and get its id
-        answers = _generic_answers()
-        matched_id = None
-        matched_answer = None
-        # Try to find the id for the matched answer
-        for answer_id, answer_text in answers.items():
-            if answer_text.strip() == "":
-                continue
-            if _match_generic_question(userInput) == answer_text:
-                matched_id = answer_id
-                matched_answer = answer_text
-                break
-        if matched_answer:
-            response = f"Question: {matched_id}\nAnswer: {matched_answer}"
-            if on_delta:
-                on_delta(response)
-            self.db.save_message("user", userInput)
-            self.db.save_message("assistant", response)
-            return response
-
+        # Generic answers are accessed via the UI sidebar only — no auto-matching here.
         cache_key = f"{selectedModel}::{userInput}"
         use_cache = not stream
         if use_cache:

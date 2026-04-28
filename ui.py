@@ -145,8 +145,17 @@ class OverlayApp:
             font=("Segoe UI", 9)
         )
 
-        log_frame = tk.Frame(self.root, bg="#111111")
-        log_frame.pack(padx=6, fill="both", expand=True)
+        content_frame = tk.Frame(self.root, bg="#111111")
+        content_frame.pack(padx=6, fill="both", expand=True)
+
+        # Left sidebar — generic answer quick-access panel (click a key to display its answer)
+        self._sidebar_frame = tk.Frame(content_frame, bg="#1a1a1a", width=140)
+        self._sidebar_frame.pack(side="left", fill="y", padx=(0, 4))
+        self._sidebar_frame.pack_propagate(False)
+        self._build_generic_sidebar(self._sidebar_frame)
+
+        log_frame = tk.Frame(content_frame, bg="#111111")
+        log_frame.pack(side="left", fill="both", expand=True)
 
         self.log_scrollbar = tk.Scrollbar(log_frame, orient="vertical", cursor="arrow")
         self.log_scrollbar.pack(side="right", fill="y")
@@ -177,6 +186,7 @@ class OverlayApp:
         self.log.tag_configure("assistant", foreground="#50fa7b", background="#282a36", spacing1=1, spacing3=2)
         self.log.tag_configure("system", foreground="#50fa7b", background="#111111", spacing1=1, spacing3=2)
         self.log.tag_configure("thinking", foreground="#888888", background="#1a1a1a", spacing1=1, spacing3=2)
+        self.log.tag_configure("generic_key", foreground="#f1fa8c", background="#1b1d2a", spacing1=2, spacing3=2, font=("Segoe UI", 9, "bold"))
         self.log.pack(side="left", fill="both", expand=True)
         self.log.bind("<Control-c>", self.copy_selection)
         self.log.bind("<Control-Insert>", self.copy_selection)
@@ -413,6 +423,78 @@ class OverlayApp:
         self._file_indicator_label.bind('<Control-v>', self._on_paste_intercept)
         self._file_row.bind('<Button-1>', lambda e: self._file_row.focus_set())
         self._file_indicator_label.bind('<Button-1>', lambda e: self._file_row.focus_set())
+
+    def _build_generic_sidebar(self, parent: tk.Frame):
+        """Populate the left sidebar with clickable generic answer keys."""
+        tk.Label(
+            parent,
+            text="Quick Answers",
+            bg="#1a1a1a",
+            fg="#666666",
+            font=("Segoe UI", 8, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=4, pady=(4, 2))
+
+        sb = tk.Scrollbar(parent, orient="vertical", cursor="arrow")
+        sb.pack(side="right", fill="y")
+
+        self._generic_listbox = tk.Listbox(
+            parent,
+            bg="#1a1a1a",
+            fg="#aaaaaa",
+            selectbackground="#44475a",
+            selectforeground="#ffffff",
+            font=("Segoe UI", 8),
+            relief="flat",
+            cursor="arrow",
+            activestyle="none",
+            yscrollcommand=sb.set,
+            bd=0,
+            highlightthickness=0,
+        )
+        sb.config(command=self._generic_listbox.yview)
+        self._generic_listbox.pack(side="left", fill="both", expand=True)
+        self._generic_listbox.bind("<ButtonRelease-1>", self._on_generic_key_select)
+
+        self._generic_keys = []
+        try:
+            answers = self.ai.get_generic_answers()
+            for key in answers:
+                self._generic_keys.append(key)
+                label = key[:26] + "\u2026" if len(key) > 26 else key
+                self._generic_listbox.insert(tk.END, label)
+        except Exception:
+            pass
+
+    def _on_generic_key_select(self, event):
+        """Append the selected generic answer to the log (never replaces previous entries)."""
+        try:
+            idx = self._generic_listbox.nearest(event.y)
+            if idx < 0 or idx >= len(self._generic_keys):
+                return
+            key = self._generic_keys[idx]
+            answers = self.ai.get_generic_answers()
+            answer = answers.get(key)
+            if not answer:
+                return
+
+            # Always append — never overwrite existing log content
+            block_start = self.log.index(tk.END)
+            self.log.insert(tk.END, f"[Generic] {key}\n", "generic_key")
+            self.log.insert(tk.END, f"Assistant: {answer}\n", "assistant")
+            # Scroll to the TOP of the inserted block, not the bottom
+            self.log.see(block_start)
+
+            # Store for follow-up context injection
+            self._active_generic_key = key
+            self._active_generic_answer = answer
+
+            # Keep the item highlighted so the user sees the active selection
+            self._generic_listbox.selection_clear(0, tk.END)
+            self._generic_listbox.selection_set(idx)
+            self._generic_listbox.see(idx)
+        except Exception:
+            pass
 
     def _set_selected_model(self, model_name: str):
         self.selected_model = model_name
@@ -1306,6 +1388,16 @@ class OverlayApp:
                         self.root.after(0, lambda: self.send_button.config(state="normal"))
                         self.root.after(0, lambda: self.status_label.config(text="Ready for the next prompt.", fg="#50fa7b"))
                         return
+
+            # Inject active generic answer as context for follow-up questions
+            active_key = getattr(self, '_active_generic_key', None)
+            active_answer = getattr(self, '_active_generic_answer', None)
+            if active_key and active_answer and prompt:
+                combined = (
+                    f"[Context \u2014 topic from quick answers: {active_key}]\n"
+                    f"{active_answer}\n\n"
+                    f"Follow-up question: {combined}"
+                )
 
             # If the prompt is ML/AI related, enforce gpt_5 strict output structure
             ml_keywords = [

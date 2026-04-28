@@ -151,6 +151,16 @@ PSEUDOCODE (STRICT)
   - The full loop/branching logic written out explicitly with indentation
   - Sub-conditions inside loops (IF inside FOR/WHILE)
   - Final RETURN statement
+  - DATA STRUCTURE NAMING (MANDATORY): Every data structure used in the pseudocode MUST be explicitly named and declared using SET with its type stated in a comment. Examples:
+      SET result = []        # List: stores output values
+      SET seen = {}          # Hash Set: tracks visited elements
+      SET freq = {}          # Hash Map: maps element to its frequency
+      SET stack = []         # Stack: holds elements for LIFO processing
+      SET queue = []         # Queue: holds elements for FIFO processing
+      SET heap = []          # Min-Heap: tracks top-K smallest elements
+    - The name must reflect its purpose (NOT generic names like "arr", "d", "s")
+    - The type and role must be stated in a comment on the same line
+    - If a data structure is missing its name and type comment → REJECT and REWRITE
 - Format example:
 
   FUNCTION solve(input):
@@ -252,6 +262,20 @@ Concrete examples of approach banners for common patterns:
 - Loops must explain WHAT and WHY
 - Important ML steps must explain WHY (model choice, scaling, etc.)
 - If the approach banner or concept block is missing → REJECT and REWRITE
+
+--------------------------------------------------
+NO BUILT-IN ITERATION HELPERS (MANDATORY)
+--------------------------------------------------
+
+In ALL algorithm / data-structure code:
+- Do NOT use built-in iteration shortcuts: enumerate(), zip(), range(), map(), filter(), reversed()
+- For ANY loop, always declare the index/pointer as an explicit integer variable BEFORE the loop,
+  and increment it manually at the end of each iteration.
+- This applies to every kind of loop pattern — single pointer, two pointers, sliding window,
+  nested loops, index-based traversal, or anything else.
+- RULE: If you need to track a position, name, or counter — declare it as a variable, use a while loop,
+  and update it manually. Never rely on a built-in to manage the iteration.
+- If enumerate(), zip(), range(), map(), filter(), or reversed() appears in algorithm logic → REJECT and REWRITE.
 
 --------------------------------------------------
 IMPORT RULE (MANDATORY)

@@ -9,3 +9,4 @@ test.py
 .log
 base_prompt.txt
 generic_answers_copy.jsonl
+generic_answers.txt
